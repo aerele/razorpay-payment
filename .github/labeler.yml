@@ -1,0 +1,4 @@
+# Any python files modifed but no test files modified
+needs-tests:
+- any: ['razorpay_payment/**/*.py']
+  all: ['!razorpay_payment/**/test*.py']
