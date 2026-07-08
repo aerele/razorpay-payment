@@ -498,7 +498,24 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		custom_redirect_to = frappe.get_doc(
 			self.data.reference_doctype, self.data.reference_docname
 		).run_method("on_payment_authorized", self.flags.status_changed_to)
+		self.stamp_payment_entry()
 		return custom_redirect_to or data.get("redirect_to") or None
+
+	def stamp_payment_entry(self):
+		"""Record the razorpay_payment_id on the booked Payment Entry (enables refunds).
+
+		on_payment_authorized books a Payment Entry whose reference_no is the
+		Payment Request name (erpnext create_payment_entry), which matches our
+		reference_docname, so we can find it and stamp the payment id.
+		"""
+		payment_id = self.data.get("razorpay_payment_id")
+		if not (payment_id and frappe.get_meta("Payment Entry").has_field("razorpay_payment_id")):
+			return
+		pe = frappe.db.get_value(
+			"Payment Entry", {"reference_no": self.data.reference_docname, "docstatus": 1}, "name"
+		)
+		if pe:
+			frappe.db.set_value("Payment Entry", pe, "razorpay_payment_id", payment_id, update_modified=False)
 
 	def settlement_redirect(self, data, status, custom_redirect_to=None):
 		redirect_to = custom_redirect_to or data.get("redirect_to") or None

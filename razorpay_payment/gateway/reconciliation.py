@@ -7,6 +7,9 @@
 import json
 
 import frappe
+from frappe import _
+
+from razorpay_payment.gateway.client import from_paisa
 
 
 def route_event(event, settings):
@@ -63,6 +66,25 @@ def mark_payment_failed(event, settings):
 	return {"status_label": "Processed"}
 
 
+def process_refund(event, settings):
+	"""A refund webhook: flag the linked Payment Entry (mirrors Stripe — a comment)."""
+	refund = _entity(event, "refund")
+	payment_id = refund.get("payment_id")
+	if not payment_id:
+		return {"status_label": "Ignored"}
+	pe = frappe.db.get_value("Payment Entry", {"razorpay_payment_id": payment_id, "docstatus": 1}, "name")
+	if not pe:
+		return {"status_label": "Ignored"}
+	amount = from_paisa(refund.get("amount") or 0)
+	frappe.get_doc("Payment Entry", pe).add_comment(
+		"Comment",
+		_("Razorpay refund processed: {0} (refund {1}). Post a credit note / reversal if required.").format(
+			amount, refund.get("id")
+		),
+	)
+	return {"status_label": "Processed", "reference_doctype": "Payment Entry", "reference_name": pe}
+
+
 def _entity(event, key):
 	return ((event.get("payload") or {}).get(key) or {}).get("entity") or {}
 
@@ -79,4 +101,6 @@ _HANDLERS = {
 	"payment.captured": reconcile_payment,
 	"order.paid": reconcile_payment,
 	"payment.failed": mark_payment_failed,
+	"refund.processed": process_refund,
+	"refund.created": process_refund,
 }

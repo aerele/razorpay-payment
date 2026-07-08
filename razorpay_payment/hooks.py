@@ -16,6 +16,11 @@ scheduler_events = {
 	"all": ["razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.capture_payment"],
 }
 
+# Custom fields on ERPNext doctypes (razorpay_payment_id on Payment Entry, for refunds).
+after_install = "razorpay_payment.install.after_install"
+after_migrate = "razorpay_payment.install.setup_custom_fields"
+before_uninstall = "razorpay_payment.install.remove_custom_fields"
+
 add_to_apps_screen = [
 	{
 		"name": "razorpay_payment",
