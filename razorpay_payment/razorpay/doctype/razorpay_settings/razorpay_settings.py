@@ -59,13 +59,10 @@ For razorpay payment status is Authorized
 
 """
 
-import hashlib
-import hmac
 import json
 from urllib.parse import urlencode
 
 import frappe
-import razorpay
 from frappe import _
 from frappe.integrations.utils import (
 	create_request_log,
@@ -76,6 +73,8 @@ from frappe.model.document import Document
 from frappe.utils import call_hook_method, cint, get_timestamp, get_url
 from payment_core.api.gateway import GatewayControllerMixin
 from payment_core.utils import create_payment_gateway
+
+from razorpay_payment.gateway.client import to_paisa
 
 
 class RazorpaySettings(GatewayControllerMixin, Document):
@@ -212,11 +211,6 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		"ZMW",
 	)
 
-	def init_client(self):
-		if self.api_key:
-			secret = self.get_password(fieldname="api_secret", raise_exception=False)
-			self.client = razorpay.Client(auth=(self.api_key, secret))
-
 	def validate(self):
 		create_payment_gateway("Razorpay")
 		call_hook_method("payment_gateway_enabled", gateway="Razorpay")
@@ -345,15 +339,16 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			kwargs.setdefault("receipt", kwargs.get("order_id"))
 			order = self.create_order(**kwargs)
 			kwargs.update({"order_id": order.get("id")})
-
-		integration_request = create_request_log(kwargs, service_name="Razorpay")
+			# create_order already logged the Integration Request; reuse it as the token.
+			integration_request = frappe.get_doc("Integration Request", order["integration_request"])
+		else:
+			integration_request = create_request_log(kwargs, service_name="Razorpay")
 		return get_url(f"./razorpay_checkout?token={integration_request.name}")
 
 	def create_order(self, **kwargs):
 		# Creating Orders https://razorpay.com/docs/api/orders/
 
-		# convert rupees to paisa
-		kwargs["amount"] = int(kwargs["amount"] * 100)
+		kwargs["amount"] = to_paisa(kwargs["amount"])
 
 		# Create integration log
 		integration_request = create_request_log(kwargs, service_name="Razorpay")
@@ -375,6 +370,9 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 					),
 					data=payment_options,
 				)
+				# Persist the order id on the Integration Request so the reused token
+				# carries it (checkout context + settlement order-binding need it).
+				integration_request.update_status({"order_id": order.get("id")}, integration_request.status)
 				order["integration_request"] = integration_request.name
 				return order  # Order returned to be consumed by razorpay.js
 			except Exception:
@@ -499,20 +497,6 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			)
 		except Exception:
 			frappe.log_error(frappe.get_traceback())
-
-	def verify_signature(self, body, signature, key):
-		key = bytes(key, "utf-8")
-		body = bytes(body, "utf-8")
-
-		dig = hmac.new(key=key, msg=body, digestmod=hashlib.sha256)
-
-		generated_signature = dig.hexdigest()
-		result = hmac.compare_digest(generated_signature, signature)
-
-		if not result:
-			frappe.throw(_("Razorpay Signature Verification Failed"), exc=frappe.PermissionError)
-
-		return result
 
 	@frappe.whitelist()
 	def clear(self):
