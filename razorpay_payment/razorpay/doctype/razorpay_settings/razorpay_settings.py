@@ -654,6 +654,14 @@ def get_api_key():
 
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
+def webhooks():
+	"""Razorpay webhook receiver: verify signature, dedupe, and reconcile."""
+	from razorpay_payment.gateway.webhooks import handle_request
+
+	return handle_request()
+
+
+@frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 def get_order(doctype: str, docname: str):
 	from payment_core.utils import guard_payment_reference
 
