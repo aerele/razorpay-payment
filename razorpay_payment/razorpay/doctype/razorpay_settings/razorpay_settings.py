@@ -70,11 +70,11 @@ from frappe.integrations.utils import (
 	make_post_request,
 )
 from frappe.model.document import Document
-from frappe.utils import call_hook_method, cint, get_timestamp, get_url
+from frappe.utils import add_to_date, call_hook_method, cint, get_timestamp, get_url, now_datetime
 from payment_core.api.gateway import GatewayControllerMixin
 from payment_core.utils import create_payment_gateway
 
-from razorpay_payment.gateway.client import to_paisa
+from razorpay_payment.gateway.client import RAZORPAY_API, to_paisa, verify_payment_signature
 
 
 class RazorpaySettings(GatewayControllerMixin, Document):
@@ -384,7 +384,9 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 
 		try:
 			self.integration_request = frappe.get_doc("Integration Request", self.data.token)
-			self.integration_request.update_status(self.data, "Queued")
+			# Merge only the payment proof; the browser must not overwrite the
+			# authoritative amount/order/reference we stored server-side.
+			self.integration_request.update_status(_settlement_proof(self.data), "Queued")
 			return self.authorize_payment()
 
 		except Exception:
@@ -400,73 +402,116 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			}
 
 	def authorize_payment(self):
-		"""
-		An authorization is performed when user's payment details are successfully authenticated by the bank.
-		The money is deducted from the customer's account, but will not be transferred to the merchant's account
-		until it is explicitly captured by merchant.
+		"""Verify the payment with Razorpay, book the reference, then mark the IR.
+
+		Reached from the checkout page (create_request) and the Orders JS callback
+		(order_payment_success). Serialised + idempotent so a redirect and a webhook
+		cannot double-book, and the IR is marked settled only after booking succeeds.
 		"""
 		data = json.loads(self.integration_request.data)
 		settings = self.get_settings(data)
 
+		# Serialise concurrent settle attempts (redirect + webhook + refresh); if this
+		# Integration Request was already settled, return the success redirect as-is.
+		if not self.claim_for_settlement():
+			return self.settlement_redirect(data, 200)
+
 		try:
 			resp = make_get_request(
-				f"https://api.razorpay.com/v1/payments/{self.data.razorpay_payment_id}",
+				f"{RAZORPAY_API}/payments/{self.data.razorpay_payment_id}",
 				auth=(settings.api_key, settings.api_secret),
 			)
+			self.assert_payment_matches_order(data, resp, settings)
 
-			if resp.get("status") == "authorized":
-				self.integration_request.update_status(data, "Authorized")
+			payment_status = resp.get("status")
+			if payment_status == "authorized":
 				self.flags.status_changed_to = "Authorized"
-
-			elif resp.get("status") == "captured":
-				self.integration_request.update_status(data, "Completed")
+			elif payment_status == "captured":
 				self.flags.status_changed_to = "Completed"
-
-			elif data.get("subscription_id"):
-				if resp.get("status") == "refunded":
-					# if subscription start date is in future then
-					# razorpay refunds the amount after authorizing the card details
-					# thus changing status to Verified
-
-					self.integration_request.update_status(data, "Completed")
-					self.flags.status_changed_to = "Verified"
-
+			elif data.get("subscription_id") and payment_status == "refunded":
+				# Future-dated subscription: Razorpay refunds the card-auth amount.
+				self.flags.status_changed_to = "Verified"
 			else:
-				frappe.log_error(message=str(resp), title="Razorpay Payment not authorized")
+				frappe.throw(
+					_("Razorpay payment {0} is not settleable (status {1}).").format(
+						self.data.razorpay_payment_id, payment_status
+					)
+				)
 
+			redirect_to = self.authorize_reference(data)
+			# Booking succeeded, so it is now safe to mark the IR settled.
+			ir_status = "Authorized" if self.flags.status_changed_to == "Authorized" else "Completed"
+			self.integration_request.update_status(data, ir_status)
 		except Exception:
-			frappe.log_error()
+			# Never swallow a settlement failure: mark the IR Failed so the capture sweep
+			# (and, once configured, the webhook) can re-drive it, and fail closed.
+			self.integration_request.db_set("status", "Failed", update_modified=False)
+			self.integration_request.db_set("error", frappe.get_traceback(), update_modified=False)
+			frappe.log_error(frappe.get_traceback(), "Razorpay settlement failed")
+			return {"redirect_to": "payment-failed", "status": 402}
 
-		status = frappe.flags.integration_request.status_code
+		return self.settlement_redirect(data, 200, custom_redirect_to=redirect_to)
 
-		redirect_to = data.get("redirect_to") or None
+	def claim_for_settlement(self):
+		"""Row-lock the Integration Request; return False if it is already settled.
+
+		SELECT ... FOR UPDATE serialises two callers racing to settle the same
+		payment: the first proceeds and commits a settled status, the second blocks,
+		then sees it settled here and backs off. The lock is held for the rest of the
+		request, so booking runs before any concurrent caller is released.
+		"""
+		status = frappe.db.get_value(
+			"Integration Request", self.integration_request.name, "status", for_update=True
+		)
+		return status not in ("Authorized", "Completed", "Verified")
+
+	def assert_payment_matches_order(self, data, payment, settings):
+		"""Bind the fetched payment to this order, amount and (when sent) signature.
+
+		Without this a caller could present a razorpay_payment_id that succeeded for a
+		different (cheaper) order and settle this one. The payment is re-fetched from
+		Razorpay (authoritative), and its order and amount must match the ones we
+		stored; when the callback also carries the HMAC signature it is verified too.
+		"""
+		order_id = data.get("order_id")
+		if order_id and payment.get("order_id") != order_id:
+			frappe.throw(
+				_("This payment does not belong to the order being settled."), frappe.PermissionError
+			)
+
+		expected_amount = data.get("amount")
+		if expected_amount is not None and cint(payment.get("amount")) != cint(expected_amount):
+			frappe.throw(_("Razorpay payment amount does not match the order."), frappe.PermissionError)
+
+		signature = data.get("razorpay_signature")
+		if signature and not verify_payment_signature(
+			order_id, self.data.razorpay_payment_id, signature, settings.api_secret
+		):
+			frappe.throw(_("Razorpay signature verification failed."), frappe.PermissionError)
+
+	def authorize_reference(self, data):
+		"""Run on_payment_authorized on the reference doc; return any custom redirect."""
+		if not (self.data.reference_doctype and self.data.reference_docname):
+			return data.get("redirect_to") or None
+		frappe.flags.data = data
+		custom_redirect_to = frappe.get_doc(
+			self.data.reference_doctype, self.data.reference_docname
+		).run_method("on_payment_authorized", self.flags.status_changed_to)
+		return custom_redirect_to or data.get("redirect_to") or None
+
+	def settlement_redirect(self, data, status, custom_redirect_to=None):
+		redirect_to = custom_redirect_to or data.get("redirect_to") or None
 		redirect_message = data.get("redirect_message") or None
-		if self.flags.status_changed_to in ("Authorized", "Verified", "Completed"):
-			if self.data.reference_doctype and self.data.reference_docname:
-				custom_redirect_to = None
-				try:
-					frappe.flags.data = data
-					custom_redirect_to = frappe.get_doc(
-						self.data.reference_doctype, self.data.reference_docname
-					).run_method("on_payment_authorized", self.flags.status_changed_to)
-
-				except Exception:
-					frappe.log_error(frappe.get_traceback())
-
-				if custom_redirect_to:
-					redirect_to = custom_redirect_to
-
+		if status == 200 or self.flags.status_changed_to in ("Authorized", "Verified", "Completed"):
 			redirect_url = (
 				f"payment-success?doctype={self.data.reference_doctype}&docname={self.data.reference_docname}"
 			)
 		else:
 			redirect_url = "payment-failed"
-
 		if redirect_to:
 			redirect_url += "&" + urlencode({"redirect_to": redirect_to})
 		if redirect_message:
 			redirect_url += "&" + urlencode({"redirect_message": redirect_message})
-
 		return {"redirect_to": redirect_url, "status": status}
 
 	def get_settings(self, data):
@@ -504,6 +549,20 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		self.redirect_url = None
 		self.flags.ignore_mandatory = True
 		self.save()
+
+
+def _settlement_proof(data):
+	"""Client-supplied fields that are safe to merge onto the stored request.
+
+	The checkout options blob carries a display amount and echoes the order id;
+	only the payment proof may be trusted from the browser. Everything else
+	(amount, order, reference) stays as the server logged it.
+	"""
+	return {
+		k: data.get(k)
+		for k in ("razorpay_payment_id", "razorpay_order_id", "razorpay_signature")
+		if data.get(k) is not None
+	}
 
 
 def capture_payment(is_sandbox=False, sanbox_response=None):
@@ -553,6 +612,40 @@ def capture_payment(is_sandbox=False, sanbox_response=None):
 			doc.save()
 			frappe.log_error(doc.error, f"{doc.name} Failed")
 
+	if not is_sandbox:
+		recover_failed_settlements(controller)
+
+
+def recover_failed_settlements(controller):
+	"""Re-drive Razorpay settlements whose booking failed (F1/F4 recovery).
+
+	A settlement whose on_payment_authorized threw is left Failed with the money
+	already authorized/captured at Razorpay; re-running authorize_payment (row-locked
+	and idempotent) books it. Bounded to the last 24h so permanent failures are not
+	retried forever.
+	"""
+	cutoff = add_to_date(now_datetime(), hours=-24)
+	for doc in frappe.get_all(
+		"Integration Request",
+		filters={
+			"status": "Failed",
+			"integration_request_service": "Razorpay",
+			"modified": (">", cutoff),
+		},
+		fields=["name", "data"],
+	):
+		data = json.loads(doc.data)
+		if not data.get("razorpay_payment_id"):
+			continue
+		try:
+			controller.integration_request = frappe.get_doc("Integration Request", doc.name)
+			controller.data = frappe._dict(data)
+			controller.authorize_payment()
+			frappe.db.commit()
+		except Exception:
+			frappe.db.rollback()
+			frappe.log_error(frappe.get_traceback(), f"Razorpay settlement recovery failed for {doc.name}")
+
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 def get_api_key():
@@ -562,7 +655,10 @@ def get_api_key():
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 def get_order(doctype: str, docname: str):
+	from payment_core.utils import guard_payment_reference
+
 	# Order returned to be consumed by razorpay.js
+	guard_payment_reference(doctype, docname)
 	doc = frappe.get_doc(doctype, docname)
 	try:
 		# Do not use run_method here as it fails silently
@@ -585,8 +681,8 @@ def order_payment_success(integration_request: str, params: str):
 	params = json.loads(params)
 	integration = frappe.get_doc("Integration Request", integration_request)
 
-	# Update integration request
-	integration.update_status(params, integration.status)
+	# Merge only the payment proof; never let the client overwrite the stored amount/order.
+	integration.update_status(_settlement_proof(params), integration.status)
 	integration.reload()
 
 	data = json.loads(integration.data)
