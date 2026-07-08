@@ -335,6 +335,15 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 				if currency:
 					kwargs["currency"] = currency
 
+			# Attach a reusable Razorpay customer so the card can be tokenised on opt-in.
+			if kwargs.get("save_card") or kwargs.get("save"):
+				from razorpay_payment.gateway.customers import get_or_create_customer
+
+				customer_id = get_or_create_customer(kwargs)
+				if customer_id:
+					kwargs["customer_id"] = customer_id
+					kwargs["save"] = 1
+
 		# create a razorpay order unless a valid razorpay order id is already provided
 		if not str(kwargs.get("order_id") or "").startswith("order_"):
 			kwargs.setdefault("receipt", kwargs.get("order_id"))
@@ -423,6 +432,10 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 				auth=(settings.api_key, settings.api_secret),
 			)
 			self.assert_payment_matches_order(data, resp, settings)
+
+			from razorpay_payment.gateway.customers import store_payment_token
+
+			store_payment_token(resp)
 
 			payment_status = resp.get("status")
 			if payment_status == "authorized":

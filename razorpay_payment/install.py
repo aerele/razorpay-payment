@@ -20,6 +20,18 @@ RAZORPAY_CUSTOM_FIELDS = {
 			"module": "Razorpay",
 		}
 	],
+	"Customer": [
+		{
+			"fieldname": "razorpay_customer_id",
+			"fieldtype": "Data",
+			"label": "Razorpay Customer ID",
+			"read_only": 1,
+			"no_copy": 1,
+			"print_hide": 1,
+			"insert_after": "default_currency",
+			"module": "Razorpay",
+		}
+	],
 }
 
 

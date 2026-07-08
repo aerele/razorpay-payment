@@ -42,6 +42,8 @@ def get_context(context):
 		context["subscription_id"] = (
 			payment_details["subscription_id"] if payment_details.get("subscription_id") else ""
 		)
+		context["customer_id"] = payment_details.get("customer_id", "")
+		context["save"] = cint(payment_details.get("save"))
 
 	except Exception:
 		frappe.redirect_to_message(
