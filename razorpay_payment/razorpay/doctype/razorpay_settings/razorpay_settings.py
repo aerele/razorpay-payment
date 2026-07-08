@@ -74,7 +74,12 @@ from frappe.utils import add_to_date, call_hook_method, cint, get_timestamp, get
 from payment_core.api.gateway import GatewayControllerMixin
 from payment_core.utils import create_payment_gateway
 
-from razorpay_payment.gateway.client import RAZORPAY_API, to_paisa, verify_payment_signature
+from razorpay_payment.gateway.client import (
+	RAZORPAY_API,
+	to_paisa,
+	verify_payment_signature,
+	verify_webhook_signature,
+)
 
 
 class RazorpaySettings(GatewayControllerMixin, Document):
@@ -293,29 +298,25 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 
 		try:
 			resp = make_post_request(
-				"https://api.razorpay.com/v1/subscriptions",
+				f"{RAZORPAY_API}/subscriptions",
 				auth=(settings.api_key, settings.api_secret),
 				data=json.dumps(subscription_details),
 				headers={"content-type": "application/json"},
 			)
-
 			if resp.get("status") == "created":
 				kwargs["subscription_id"] = resp.get("id")
-				frappe.flags.status = "created"
-				return kwargs
 			else:
 				frappe.log_error(message=str(resp), title="Razorpay Failed while creating subscription")
-
+				kwargs["subscription_id"] = None
 		except Exception:
 			frappe.log_error()
+			kwargs["subscription_id"] = None
+
+		return kwargs
 
 	def prepare_subscription_details(self, settings, **kwargs):
 		if not kwargs.get("subscription_id"):
 			kwargs = self.setup_subscription(settings, **kwargs)
-
-		if frappe.flags.status != "created":
-			kwargs["subscription_id"] = None
-
 		return kwargs
 
 	def get_payment_url(self, **kwargs):
@@ -729,18 +730,22 @@ def convert_rupee_to_paisa(**kwargs):
 def razorpay_subscription_callback():
 	try:
 		data = frappe.local.form_dict
+		verify_subscription_callback(data)
 
-		validate_payment_callback(data)
+		# Drop duplicate deliveries (Razorpay retries) on the event id.
+		event_id = frappe.get_request_header("X-Razorpay-Event-Id")
+		if event_id and subscription_event_seen(event_id, data):
+			return {"status": "duplicate"}
 
 		data.update({"payment_gateway": "Razorpay"})
-
 		doc = frappe.get_doc(
 			{
-				"data": json.dumps(frappe.local.form_dict),
+				"data": json.dumps(dict(data)),
 				"doctype": "Integration Request",
 				"request_description": "Subscription Notification",
 				"is_remote_request": 1,
 				"status": "Queued",
+				"integration_request_service": "Razorpay",
 			}
 		).insert(ignore_permissions=True)
 		frappe.db.commit()
@@ -752,18 +757,60 @@ def razorpay_subscription_callback():
 			is_async=True,
 			**{"doctype": "Integration Request", "docname": doc.name},
 		)
-
 	except frappe.InvalidStatusError:
+		# Not an actionable/active subscription event — acknowledge without booking.
 		pass
-	except Exception as e:
-		frappe.log(frappe.log_error(title=e))
+	except frappe.PermissionError:
+		frappe.local.response["http_status_code"] = 400
+		return {"status": "invalid signature"}
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "Razorpay subscription callback failed")
+
+
+def verify_subscription_callback(data):
+	"""Authenticate a subscription webhook.
+
+	Prefer the X-Razorpay-Signature HMAC when a webhook secret is configured;
+	otherwise fall back to re-fetching the subscription and requiring it active.
+	"""
+	settings_doc = frappe.get_doc("Razorpay Settings")
+	secret = settings_doc.get_password("webhook_secret", raise_exception=False)
+	if secret:
+		raw = frappe.request.get_data() if frappe.request else b""
+		body = raw.decode("utf-8") if isinstance(raw, bytes) else (raw or "")
+		signature = frappe.get_request_header("X-Razorpay-Signature")
+		if not (signature and verify_webhook_signature(body, signature, secret)):
+			frappe.throw(_("Razorpay signature verification failed."), frappe.PermissionError)
+	else:
+		validate_payment_callback(data)
+
+
+def subscription_event_seen(event_id, data):
+	"""Record the event in Razorpay Webhook Log; return True if already processed."""
+	if frappe.db.exists("Razorpay Webhook Log", {"razorpay_event_id": event_id}):
+		return True
+	try:
+		frappe.get_doc(
+			{
+				"doctype": "Razorpay Webhook Log",
+				"razorpay_event_id": event_id,
+				"event_type": data.get("event"),
+				"status": "Processed",
+				"payload": frappe.as_json(dict(data)),
+			}
+		).insert(ignore_permissions=True)
+		frappe.db.commit()
+		return False
+	except (frappe.exceptions.DuplicateEntryError, frappe.UniqueValidationError):
+		frappe.db.rollback()
+		return True
 
 
 def validate_payment_callback(data):
 	def _throw():
 		frappe.throw(_("Invalid Subscription"), exc=frappe.InvalidStatusError)
 
-	subscription_id = data.get("payload").get("subscription").get("entity").get("id")
+	subscription_id = (((data.get("payload") or {}).get("subscription") or {}).get("entity") or {}).get("id")
 
 	if not (subscription_id):
 		_throw()
