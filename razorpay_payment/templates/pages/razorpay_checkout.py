@@ -29,9 +29,9 @@ def get_context(context):
 	try:
 		validate_integration_request(frappe.form_dict["token"])
 
-		doc = frappe.get_doc("Integration Request", frappe.form_dict["token"])
-
-		payment_details = json.loads(doc.data)
+		# Only the data field is consumed — read it directly (no full-doc load).
+		data_json = frappe.db.get_value("Integration Request", frappe.form_dict["token"], "data")
+		payment_details = json.loads(data_json)
 
 		for key in expected_keys:
 			context[key] = payment_details[key]
@@ -65,8 +65,21 @@ def get_api_key():
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 def make_payment(
-	razorpay_payment_id: str, options: str, reference_doctype: str, reference_docname: str, token: str
+	razorpay_payment_id: str,
+	options: str,
+	reference_doctype: str,
+	reference_docname: str,
+	token: str,
+	razorpay_order_id: str | None = None,
+	razorpay_signature: str | None = None,
 ):
+	# Reject payment endpoints pointed at an arbitrary or non-existent reference.
+	# Authenticated callers must also own it; the guest checkout flow is allowed
+	# because the Integration Request token (minted by get_payment_url) is the auth.
+	guard_payment_reference(reference_doctype, reference_docname)
+	if frappe.session.user != "Guest":
+		frappe.has_permission(reference_doctype, "read", reference_docname, throw=True)
+
 	data = {}
 
 	if isinstance(options, str):
@@ -75,12 +88,13 @@ def make_payment(
 	data.update(
 		{
 			"razorpay_payment_id": razorpay_payment_id,
+			"razorpay_order_id": razorpay_order_id,
+			"razorpay_signature": razorpay_signature,
 			"reference_docname": reference_docname,
 			"reference_doctype": reference_doctype,
 			"token": token,
 		}
 	)
 
-	data = frappe.get_doc("Razorpay Settings").create_request(data)
-	frappe.db.commit()
-	return data
+	# Frappe commits at request end, before the response reaches the browser.
+	return frappe.get_doc("Razorpay Settings").create_request(data)
