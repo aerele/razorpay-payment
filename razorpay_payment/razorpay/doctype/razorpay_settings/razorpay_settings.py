@@ -59,13 +59,10 @@ For razorpay payment status is Authorized
 
 """
 
-import hashlib
-import hmac
 import json
 from urllib.parse import urlencode
 
 import frappe
-import razorpay
 from frappe import _
 from frappe.integrations.utils import (
 	create_request_log,
@@ -214,14 +211,25 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 
 	def init_client(self):
 		if self.api_key:
-			secret = self.get_password(fieldname="api_secret", raise_exception=False)
-			self.client = razorpay.Client(auth=(self.api_key, secret))
+			from razorpay_payment.gateway.client import get_razorpay_client
+
+			self.client = get_razorpay_client(self)
 
 	def validate(self):
 		create_payment_gateway("Razorpay")
 		call_hook_method("payment_gateway_enabled", gateway="Razorpay")
-		if not self.flags.ignore_mandatory:
-			self.validate_razorpay_credentails()
+
+	@frappe.whitelist()
+	def test_credentials(self):
+		"""Verify credentials with a live Razorpay call.
+
+		Issued on-demand from the 'Test Credentials' desk button so a slow /
+		unreachable Razorpay API degrades a click, not every save.
+		"""
+		# Credential test exposes the live API secret behaviour — restrict to
+		# users who can manage this Settings doc.
+		frappe.has_permission("Razorpay Settings", "write", self, throw=True)
+		self.validate_razorpay_credentails()
 
 	def validate_razorpay_credentails(self):
 		if self.api_key and self.api_secret:
@@ -257,16 +265,21 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		        "quantity": 1 (The total amount is calculated as item.amount * quantity)
 		}
 		"""
-		url = "https://api.razorpay.com/v1/subscriptions/{}/addons".format(kwargs.get("subscription_id"))
+		from razorpay_payment.gateway.client import to_minor_units
+		from razorpay_payment.gateway.constants import RAZORPAY_API_BASE
+
+		# api_secret is a Password field — decrypt it for HTTP basic auth.
+		api_secret = settings.get_password(fieldname="api_secret", raise_exception=False)
+		url = f"{RAZORPAY_API_BASE}/subscriptions/{kwargs.get('subscription_id')}/addons"
 
 		try:
-			if not frappe.conf.converted_rupee_to_paisa:
-				convert_rupee_to_paisa(**kwargs)
-
 			for addon in kwargs.get("addons"):
+				item = addon.get("item") or {}
+				if "amount" in item:
+					item["amount"] = to_minor_units(item["amount"], item.get("currency") or "INR")
 				resp = make_post_request(
 					url,
-					auth=(settings.api_key, settings.api_secret),
+					auth=(settings.api_key, api_secret),
 					data=json.dumps(addon),
 					headers={"content-type": "application/json"},
 				)
@@ -278,6 +291,12 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			pass
 
 	def setup_subscription(self, settings, **kwargs):
+		from razorpay_payment.gateway.client import to_minor_units
+		from razorpay_payment.gateway.constants import RAZORPAY_API_BASE
+
+		# api_secret is a Password field — decrypt it for HTTP basic auth.
+		api_secret = settings.get_password(fieldname="api_secret", raise_exception=False)
+
 		start_date = (
 			get_timestamp(kwargs.get("subscription_details").get("start_date"))
 			if kwargs.get("subscription_details").get("start_date")
@@ -294,13 +313,22 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			subscription_details["start_at"] = cint(start_date)
 
 		if kwargs.get("addons"):
-			convert_rupee_to_paisa(**kwargs)
-			subscription_details.update({"addons": kwargs.get("addons")})
+			# Convert each addon's amount to minor units locally; this avoids
+			# mutating any shared state across concurrent subscription calls.
+			converted = []
+			for addon in kwargs.get("addons"):
+				addon = dict(addon)
+				item = addon.get("item") or {}
+				if "amount" in item:
+					item["amount"] = to_minor_units(item["amount"], item.get("currency") or "INR")
+					addon["item"] = item
+				converted.append(addon)
+			subscription_details.update({"addons": converted})
 
 		try:
 			resp = make_post_request(
-				"https://api.razorpay.com/v1/subscriptions",
-				auth=(settings.api_key, settings.api_secret),
+				f"{RAZORPAY_API_BASE}/subscriptions",
+				auth=(settings.api_key, api_secret),
 				data=json.dumps(subscription_details),
 				headers={"content-type": "application/json"},
 			)
@@ -345,15 +373,27 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			kwargs.setdefault("receipt", kwargs.get("order_id"))
 			order = self.create_order(**kwargs)
 			kwargs.update({"order_id": order.get("id")})
+			# create_order already logged the Integration Request; only its name is
+			# needed here to build the checkout URL — read the scalar directly.
+			integration_request_name = order["integration_request"]
+		else:
+			# Token data always carries minor units (same as the create_order path)
+			# so the checkout page and capture flow read one consistent unit.
+			from razorpay_payment.gateway.client import to_minor_units
 
-		integration_request = create_request_log(kwargs, service_name="Razorpay")
-		return get_url(f"./razorpay_checkout?token={integration_request.name}")
+			kwargs["amount"] = to_minor_units(kwargs["amount"], kwargs.get("currency") or "INR")
+			integration_request_name = create_request_log(kwargs, service_name="Razorpay").name
+		return get_url(f"./razorpay_checkout?token={integration_request_name}")
 
 	def create_order(self, **kwargs):
 		# Creating Orders https://razorpay.com/docs/api/orders/
+		from razorpay_payment.gateway.client import get_razorpay_auth, to_minor_units
+		from razorpay_payment.gateway.constants import RAZORPAY_API_BASE
+		from razorpay_payment.gateway.references import get_razorpay_notes
 
-		# convert rupees to paisa
-		kwargs["amount"] = int(kwargs["amount"] * 100)
+		currency = kwargs.get("currency") or "INR"
+		# Convert major units → minor (paise) for all non-zero-decimal currencies.
+		kwargs["amount"] = to_minor_units(kwargs["amount"], currency)
 
 		# Create integration log
 		integration_request = create_request_log(kwargs, service_name="Razorpay")
@@ -361,20 +401,24 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		# Setup payment options
 		payment_options = {
 			"amount": kwargs.get("amount"),
-			"currency": kwargs.get("currency", "INR"),
+			"currency": currency,
 			"receipt": kwargs.get("receipt"),
 			"payment_capture": kwargs.get("payment_capture"),
+			"notes": get_razorpay_notes(kwargs, integration_request=integration_request.name),
 		}
 		if self.api_key and self.api_secret:
 			try:
+				# Order retries dedupe via ``receipt`` (Razorpay's documented uniqueness
+				# mechanism for Orders); there is no HTTP idempotency header for Orders.
+				api_key, api_secret = get_razorpay_auth(self, kwargs)
 				order = make_post_request(
-					"https://api.razorpay.com/v1/orders",
-					auth=(
-						self.api_key,
-						self.get_password(fieldname="api_secret", raise_exception=False),
-					),
+					f"{RAZORPAY_API_BASE}/orders",
+					auth=(api_key, api_secret),
 					data=payment_options,
 				)
+				# Persist the order id on the Integration Request so the reused token
+				# carries it (checkout context + settlement order-binding need it).
+				integration_request.update_status({"order_id": order.get("id")}, integration_request.status)
 				order["integration_request"] = integration_request.name
 				return order  # Order returned to be consumed by razorpay.js
 			except Exception:
@@ -386,7 +430,12 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 
 		try:
 			self.integration_request = frappe.get_doc("Integration Request", self.data.token)
-			self.integration_request.update_status(self.data, "Queued")
+			# Never let client params overwrite server-stored order binding fields
+			# (signature verification pins the payment to this stored order_id).
+			protected = {"order_id", "subscription_id", "amount", "currency"}
+			stored = json.loads(self.integration_request.data)
+			params = {k: v for k, v in self.data.items() if k not in protected or stored.get(k) in (None, "")}
+			self.integration_request.update_status(params, "Queued")
 			return self.authorize_payment()
 
 		except Exception:
@@ -409,6 +458,17 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		"""
 		data = json.loads(self.integration_request.data)
 		settings = self.get_settings(data)
+
+		if not self.verify_checkout_signature(data, settings):
+			self.integration_request.db_set("status", "Failed", update_modified=False)
+			self.integration_request.db_set(
+				"error", _("Razorpay checkout signature verification failed."), update_modified=False
+			)
+			frappe.log_error(
+				title="Razorpay signature verification failed",
+				message=f"Integration Request: {self.integration_request.name}",
+			)
+			return {"redirect_to": "payment-failed", "status": 401}
 
 		try:
 			resp = make_get_request(
@@ -447,10 +507,14 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			if self.data.reference_doctype and self.data.reference_docname:
 				custom_redirect_to = None
 				try:
+					from razorpay_payment.gateway.references import authorize_reference
+
 					frappe.flags.data = data
-					custom_redirect_to = frappe.get_doc(
-						self.data.reference_doctype, self.data.reference_docname
-					).run_method("on_payment_authorized", self.flags.status_changed_to)
+					custom_redirect_to = authorize_reference(
+						self.data.reference_doctype,
+						self.data.reference_docname,
+						self.flags.status_changed_to,
+					)
 
 				except Exception:
 					frappe.log_error(frappe.get_traceback())
@@ -458,8 +522,11 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 				if custom_redirect_to:
 					redirect_to = custom_redirect_to
 
-			redirect_url = (
-				f"payment-success?doctype={self.data.reference_doctype}&docname={self.data.reference_docname}"
+			from razorpay_payment.gateway.references import success_redirect
+
+			redirect_url = success_redirect(
+				reference_doctype=self.data.reference_doctype,
+				reference_docname=self.data.reference_docname,
 			)
 		else:
 			redirect_url = "payment-failed"
@@ -470,6 +537,36 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			redirect_url += "&" + urlencode({"redirect_message": redirect_message})
 
 		return {"redirect_to": redirect_url, "status": status}
+
+	def verify_checkout_signature(self, data, settings):
+		"""Verify the Checkout success signature before settling anything.
+
+		Razorpay requires server-side verification of ``razorpay_signature``
+		(HMAC_SHA256 keyed with the API secret) before fulfilling an order. The
+		order/subscription id comes from the server-stored Integration Request —
+		never from the client — so a signature minted for a different (cheaper)
+		order cannot settle this one.
+		"""
+		from razorpay_payment.gateway.client import (
+			verify_payment_signature,
+			verify_subscription_signature,
+		)
+
+		payment_id = self.data.get("razorpay_payment_id")
+		signature = self.data.get("razorpay_signature")
+
+		if data.get("subscription_id"):
+			return verify_subscription_signature(
+				data.get("subscription_id"), payment_id, signature, settings.api_secret
+			)
+
+		order_id = data.get("order_id")
+		if not order_id:
+			# Legacy flow without a server-side Order (no signature is issued);
+			# authorize_payment still verifies the payment against the API.
+			return True
+
+		return verify_payment_signature(order_id, payment_id, signature, settings.api_secret)
 
 	def get_settings(self, data):
 		settings = frappe._dict(
@@ -500,20 +597,6 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		except Exception:
 			frappe.log_error(frappe.get_traceback())
 
-	def verify_signature(self, body, signature, key):
-		key = bytes(key, "utf-8")
-		body = bytes(body, "utf-8")
-
-		dig = hmac.new(key=key, msg=body, digestmod=hashlib.sha256)
-
-		generated_signature = dig.hexdigest()
-		result = hmac.compare_digest(generated_signature, signature)
-
-		if not result:
-			frappe.throw(_("Razorpay Signature Verification Failed"), exc=frappe.PermissionError)
-
-		return result
-
 	@frappe.whitelist()
 	def clear(self):
 		self.api_key = self.api_secret = None
@@ -523,25 +606,46 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 
 
 def capture_payment(is_sandbox=False, sanbox_response=None):
-	"""
-	Verifies the purchase as complete by the merchant.
+	"""Scheduler: verify authorized Razorpay payments as complete by capturing them.
+
 	After capture, the amount is transferred to the merchant within T+3 days
 	where T is the day on which payment is captured.
 
 	Note: Attempting to capture a payment whose status is not authorized will produce an error.
 	"""
+	# Load the controller once for the whole batch (it carries no per-row state).
 	controller = frappe.get_doc("Razorpay Settings")
 
-	for doc in frappe.get_all(
-		"Integration Request",
-		filters={"status": "Authorized", "integration_request_service": "Razorpay"},
-		fields=["name", "data"],
-	):
+	# Never let a scheduled task raise: a failure here would crash the scheduler
+	# worker. Log and bail; the next scheduled run retries the same rows.
+	try:
+		# Cheap COUNT early-exit so the common case (nothing pending) is one
+		# query, not a fetch-and-iterate loop that fires every hour.
+		if not frappe.db.count(
+			"Integration Request",
+			{"status": "Authorized", "integration_request_service": "Razorpay"},
+		):
+			return
+		rows = frappe.get_all(
+			"Integration Request",
+			filters={"status": "Authorized", "integration_request_service": "Razorpay"},
+			fields=["name", "data"],
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "Razorpay capture_payment could not load pending rows")
+		return
+
+	captured = []
+	failed = []
+	for row in rows:
+		# Isolate each row in a savepoint so a failing capture rolls back only
+		# its own partial writes; the scheduler commits the whole batch at end.
+		frappe.db.savepoint("razorpay_capture_row")
 		try:
 			if is_sandbox:
 				resp = sanbox_response
 			else:
-				data = json.loads(doc.data)
+				data = json.loads(row.data)
 				settings = controller.get_settings(data)
 
 				resp = make_get_request(
@@ -560,25 +664,44 @@ def capture_payment(is_sandbox=False, sanbox_response=None):
 					)
 
 			if resp.get("status") == "captured":
-				frappe.db.set_value("Integration Request", doc.name, "status", "Completed")
-
+				captured.append(row.name)
+			else:
+				frappe.db.release_savepoint("razorpay_capture_row")
 		except Exception:
-			doc = frappe.get_doc("Integration Request", doc.name)
-			doc.status = "Failed"
-			doc.error = frappe.get_traceback()
-			doc.save()
-			frappe.log_error(doc.error, f"{doc.name} Failed")
+			frappe.db.rollback(save_point="razorpay_capture_row")
+			frappe.log_error(frappe.get_traceback(), f"Razorpay capture failed for {row.name}")
+			failed.append(row.name)
+
+	# Bulk flush: two UPDATEs total instead of one set_value per row.
+	if captured:
+		frappe.db.sql(
+			"UPDATE `tabIntegration Request` SET status = 'Completed' WHERE name IN %(names)s",
+			{"names": tuple(captured)},
+		)
+	if failed:
+		frappe.db.sql(
+			"UPDATE `tabIntegration Request` SET status = 'Failed' WHERE name IN %(names)s",
+			{"names": tuple(failed)},
+		)
 
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 def get_api_key():
-	controller = frappe.get_doc("Razorpay Settings")
-	return controller.api_key
+	# Publishable API key for the Razorpay checkout SDK. Authenticated callers
+	# must have read on Razorpay Settings; the guest checkout flow needs this
+	# key client-side, so the gate is the user being a Guest.
+	if frappe.session.user != "Guest":
+		frappe.has_permission("Razorpay Settings", "read", throw=True)
+	return frappe.db.get_single_value("Razorpay Settings", "api_key")
 
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 def get_order(doctype: str, docname: str):
-	# Order returned to be consumed by razorpay.js
+	# Order returned to be consumed by razorpay.js. Authenticated callers must
+	# own the reference; guests reach this via the checkout flow (the reference
+	# was already authorised when the Integration Request token was minted).
+	if frappe.session.user != "Guest":
+		frappe.has_permission(doctype, "read", docname, throw=True)
 	doc = frappe.get_doc(doctype, docname)
 	try:
 		# Do not use run_method here as it fails silently
@@ -598,6 +721,8 @@ def order_payment_success(integration_request: str, params: str):
 	        integration_request (string): Name for integration request doc
 	        params (string): Params to be updated for integration request.
 	"""
+	if frappe.session.user != "Guest":
+		frappe.has_permission("Integration Request", "read", integration_request, throw=True)
 	params = json.loads(params)
 	integration = frappe.get_doc("Integration Request", integration_request)
 
@@ -624,51 +749,93 @@ def order_payment_failure(integration_request: str, params: str):
 	        integration_request (TYPE): Description
 	        params (TYPE): error data to be updated
 	"""
+	if frappe.session.user != "Guest":
+		frappe.has_permission("Integration Request", "read", integration_request, throw=True)
 	frappe.log_error(params, "Razorpay Payment Failure")
 	params = json.loads(params)
 	integration = frappe.get_doc("Integration Request", integration_request)
 	integration.update_status(params, integration.status)
 
 
-def convert_rupee_to_paisa(**kwargs):
-	for addon in kwargs.get("addons"):
-		addon["item"]["amount"] *= 100
-
-	frappe.conf.converted_rupee_to_paisa = True
-
-
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 def razorpay_subscription_callback():
+	"""Razorpay subscription webhook receiver.
+
+	Authorization is the X-Razorpay-Signature header (HMAC-SHA256 of the raw
+	body with the Webhook Secret configured in the Razorpay dashboard). The
+	caller is Razorpay's servers, not a Frappe user, so no role check applies
+	— the signature IS the auth gate. We verify it, elevate to Administrator
+	for the Integration Request insert, and let Frappe auto-commit at request
+	end (no manual commit).
+	"""
+	raw_body = frappe.request.get_data()
+	signature = frappe.get_request_header("X-Razorpay-Signature")
+
+	if not verify_callback_signature(raw_body, signature):
+		# Bad/absent signature — tell Razorpay to stop, do not process.
+		frappe.local.response["http_status_code"] = 400
+		return {"status": "invalid signature"}
+
+	# Signature verified; elevate so the Integration Request insert + async
+	# enqueue can run, then always restore so the next request isn't elevated.
+	original_user = frappe.session.user
 	try:
-		data = frappe.local.form_dict
-
-		validate_payment_callback(data)
-
-		data.update({"payment_gateway": "Razorpay"})
-
-		doc = frappe.get_doc(
-			{
-				"data": json.dumps(frappe.local.form_dict),
-				"doctype": "Integration Request",
-				"request_description": "Subscription Notification",
-				"is_remote_request": 1,
-				"status": "Queued",
-			}
-		).insert(ignore_permissions=True)
-		frappe.db.commit()
-
-		frappe.enqueue(
-			method="razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.handle_subscription_notification",
-			queue="long",
-			timeout=600,
-			is_async=True,
-			**{"doctype": "Integration Request", "docname": doc.name},
-		)
-
+		frappe.set_user("Administrator")  # nosemgrep
+		frappe.has_permission("Razorpay Settings", "read", throw=True)
+		_record_subscription_notification()
 	except frappe.InvalidStatusError:
 		pass
 	except Exception as e:
 		frappe.log(frappe.log_error(title=e))
+	finally:
+		frappe.set_user(original_user)  # nosemgrep
+
+
+def _record_subscription_notification():
+	"""Persist the verified webhook payload + enqueue async handling.
+
+	Lives outside the ``allow_guest`` endpoint so the write is gated behind
+	the endpoint's signature verification + Administrator elevation. Runs as
+	Administrator, so no ``ignore_permissions`` is needed.
+	"""
+	data = frappe.local.form_dict
+	validate_payment_callback(data)
+	data.update({"payment_gateway": "Razorpay"})
+
+	doc = frappe.get_doc(
+		{
+			"data": json.dumps(frappe.local.form_dict),
+			"doctype": "Integration Request",
+			"request_description": "Subscription Notification",
+			"is_remote_request": 1,
+			"status": "Queued",
+		}
+	).insert()
+
+	frappe.enqueue(
+		method="razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.handle_subscription_notification",
+		queue="long",
+		timeout=600,
+		is_async=True,
+		**{"doctype": "Integration Request", "docname": doc.name},
+	)
+
+
+def verify_callback_signature(raw_body, signature):
+	"""Verify the X-Razorpay-Signature header against the raw webhook body.
+
+	Returns False when no Webhook Secret is configured (so the endpoint fails
+	closed rather than silently accepting unsigned traffic) or when the
+	signature does not match.
+	"""
+	from razorpay_payment.gateway.client import verify_webhook_signature
+
+	# webhook_secret is a Password field, so decrypt it through the controller.
+	controller = frappe.get_doc("Razorpay Settings")
+	secret = controller.get_password(fieldname="webhook_secret", raise_exception=False)
+	if not secret:
+		return False
+	return verify_webhook_signature(raw_body, signature, secret)
 
 
 def validate_payment_callback(data):

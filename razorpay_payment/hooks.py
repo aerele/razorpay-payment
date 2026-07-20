@@ -11,9 +11,11 @@ required_apps = ["payment_core"]
 # Register the Razorpay service module with payment_core's gateway registry.
 payment_gateway_module = {"Razorpay": "razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings"}
 
-# Capture authorized-but-uncaptured payments (was scheduler_events["all"] in payments).
+# Capture authorized-but-uncaptured payments hourly. The manual-capture window is
+# measured in hours, so sub-minute cadence (scheduler_events["all"]) was wasteful;
+# capture_payment also early-exits on a cheap COUNT when nothing is pending.
 scheduler_events = {
-	"all": ["razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.capture_payment"],
+	"hourly": ["razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.capture_payment"],
 }
 
 add_to_apps_screen = [
