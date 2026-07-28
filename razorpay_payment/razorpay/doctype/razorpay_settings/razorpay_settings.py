@@ -398,23 +398,22 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		# Create integration log
 		integration_request = create_request_log(kwargs, service_name="Razorpay")
 
-		# Setup payment options
+		# Setup payment options. Razorpay rejects null payment_capture.
 		payment_options = {
 			"amount": kwargs.get("amount"),
 			"currency": currency,
 			"receipt": kwargs.get("receipt"),
-			"payment_capture": kwargs.get("payment_capture"),
+			"payment_capture": 1,
 			"notes": get_razorpay_notes(kwargs, integration_request=integration_request.name),
 		}
 		if self.api_key and self.api_secret:
 			try:
-				# Order retries dedupe via ``receipt`` (Razorpay's documented uniqueness
-				# mechanism for Orders); there is no HTTP idempotency header for Orders.
+				# Order retries dedupe via ``receipt``; there is no HTTP idempotency header for Orders.
 				api_key, api_secret = get_razorpay_auth(self, kwargs)
 				order = make_post_request(
 					f"{RAZORPAY_API_BASE}/orders",
 					auth=(api_key, api_secret),
-					data=payment_options,
+					json=payment_options,
 				)
 				# Persist the order id on the Integration Request so the reused token
 				# carries it (checkout context + settlement order-binding need it).
@@ -507,15 +506,8 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			if self.data.reference_doctype and self.data.reference_docname:
 				custom_redirect_to = None
 				try:
-					from razorpay_payment.gateway.references import authorize_reference
-
 					frappe.flags.data = data
-					custom_redirect_to = authorize_reference(
-						self.data.reference_doctype,
-						self.data.reference_docname,
-						self.flags.status_changed_to,
-					)
-
+					custom_redirect_to = self.authorize_reference()
 				except Exception:
 					frappe.log_error(frappe.get_traceback())
 
@@ -537,6 +529,20 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			redirect_url += "&" + urlencode({"redirect_message": redirect_message})
 
 		return {"redirect_to": redirect_url, "status": status}
+
+	def authorize_reference(self):
+		"""Settle the paid reference document via the partial-aware settler."""
+		ref = frappe.get_doc(self.data.reference_doctype, self.data.reference_docname)
+		if hasattr(ref, "on_payment_authorized"):
+			return ref.run_method("on_payment_authorized", self.flags.status_changed_to)
+		if ref.doctype == "Payment Request":
+			self.settle_payment_request(ref)
+		return None
+
+	def settle_payment_request(self, pr):
+		from razorpay_payment.gateway import settlement
+
+		return settlement.settle_payment_request(self, pr)
 
 	def verify_checkout_signature(self, data, settings):
 		"""Verify the Checkout success signature before settling anything.
@@ -660,7 +666,7 @@ def capture_payment(is_sandbox=False, sanbox_response=None):
 							data.get("razorpay_payment_id")
 						),
 						auth=(settings.api_key, settings.api_secret),
-						data={"amount": data.get("amount")},
+						json={"amount": data.get("amount")},
 					)
 
 			if resp.get("status") == "captured":
