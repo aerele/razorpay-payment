@@ -15,7 +15,10 @@ payment_gateway_module = {"Razorpay": "razorpay_payment.razorpay.doctype.razorpa
 # measured in hours, so sub-minute cadence (scheduler_events["all"]) was wasteful;
 # capture_payment also early-exits on a cheap COUNT when nothing is pending.
 scheduler_events = {
-	"hourly": ["razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.capture_payment"],
+	"hourly": [
+		"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.capture_payment",
+		"razorpay_payment.gateway.reconciliation.sweep_pending",
+	],
 }
 
 add_to_apps_screen = [
