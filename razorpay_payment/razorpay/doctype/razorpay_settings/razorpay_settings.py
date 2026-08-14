@@ -72,8 +72,25 @@ from frappe.integrations.utils import (
 from frappe.model.document import Document
 from frappe.utils import call_hook_method, cint, get_timestamp, get_url
 from payment_core.api.gateway import GatewayControllerMixin
-from payment_core.utils import create_payment_gateway
+from payment_core.utils import create_payment_gateway, get_reference_amount, guard_payment_reference
 
+from razorpay_payment.gateway import settlement
+from razorpay_payment.gateway.client import (
+	get_razorpay_auth,
+	get_razorpay_client,
+	to_minor_units,
+	verify_payment_signature,
+	verify_subscription_signature,
+	verify_webhook_signature,
+)
+from razorpay_payment.gateway.constants import RAZORPAY_API_BASE
+from razorpay_payment.gateway.references import (
+	assert_reference_payable,
+	get_razorpay_notes,
+	is_subscription_reference,
+	success_redirect,
+)
+from razorpay_payment.gateway.subscriptions import create_razorpay_subscription
 from razorpay_payment.gateway.webhooks import clear_webhook_secret_cache
 
 
@@ -213,17 +230,29 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 
 	def init_client(self):
 		if self.api_key:
-			from razorpay_payment.gateway.client import get_razorpay_client
-
 			self.client = get_razorpay_client(self)
 
 	def validate(self):
-		create_payment_gateway("Razorpay")
+		# Link Payment Gateway to this controller (needed by plan sync).
+		create_payment_gateway("Razorpay", settings="Razorpay Settings", controller=self.name)
+		# Backfill link on pre-existing gateways created without it.
+		if frappe.db.has_column("Payment Gateway", "gateway_settings"):
+			existing = frappe.db.get_value(
+				"Payment Gateway", "Razorpay", ["gateway_settings", "gateway_controller"], as_dict=True
+			)
+			if existing and (not existing.gateway_settings or not existing.gateway_controller):
+				frappe.db.set_value(
+					"Payment Gateway",
+					"Razorpay",
+					{"gateway_settings": "Razorpay Settings", "gateway_controller": self.name},
+					update_modified=False,
+				)
 		call_hook_method("payment_gateway_enabled", gateway="Razorpay")
 		self.set_webhook_endpoint()
 
 	def set_webhook_endpoint(self):
 		"""Show the admin which URL to register as a Razorpay webhook endpoint."""
+
 		endpoint = get_url("/api/method/razorpay_payment.razorpay.doctype.razorpay_settings.webhooks")
 		if self.webhook_endpoint != endpoint:
 			self.db_set("webhook_endpoint", endpoint, update_modified=False)
@@ -276,8 +305,6 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		        "quantity": 1 (The total amount is calculated as item.amount * quantity)
 		}
 		"""
-		from razorpay_payment.gateway.client import to_minor_units
-		from razorpay_payment.gateway.constants import RAZORPAY_API_BASE
 
 		# api_secret is a Password field — decrypt it for HTTP basic auth.
 		api_secret = settings.get_password(fieldname="api_secret", raise_exception=False)
@@ -302,9 +329,6 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			pass
 
 	def setup_subscription(self, settings, **kwargs):
-		from razorpay_payment.gateway.client import to_minor_units
-		from razorpay_payment.gateway.constants import RAZORPAY_API_BASE
-
 		# api_secret is a Password field — decrypt it for HTTP basic auth.
 		api_secret = settings.get_password(fieldname="api_secret", raise_exception=False)
 
@@ -364,12 +388,11 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		return kwargs
 
 	def get_payment_url(self, **kwargs):
-		from payment_core.utils import get_reference_amount, guard_payment_reference
-
 		reference_doctype = kwargs.get("reference_doctype")
 		reference_docname = kwargs.get("reference_docname")
 		if reference_doctype and reference_docname:
 			guard_payment_reference(reference_doctype, reference_docname)
+			assert_reference_payable(reference_doctype, reference_docname)
 			# Never trust a client-supplied amount for a reference that carries an authoritative total.
 			meta = frappe.get_meta(reference_doctype)
 			if meta.has_field("grand_total") or meta.has_field("amount"):
@@ -378,6 +401,12 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 					kwargs["amount"] = amount
 				if currency:
 					kwargs["currency"] = currency
+
+		# Subscription references branch to the Razorpay Subscription create flow
+		# (POST /v1/subscriptions → short_url) instead of the one-off Order flow.
+		if is_subscription_reference(kwargs):
+			# create_razorpay_subscription needs a plain dict, not kwargs.
+			return create_razorpay_subscription(self.name, kwargs)
 
 		# create a razorpay order unless a valid razorpay order id is already provided
 		if not str(kwargs.get("order_id") or "").startswith("order_"):
@@ -390,7 +419,6 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		else:
 			# Token data always carries minor units (same as the create_order path)
 			# so the checkout page and capture flow read one consistent unit.
-			from razorpay_payment.gateway.client import to_minor_units
 
 			kwargs["amount"] = to_minor_units(kwargs["amount"], kwargs.get("currency") or "INR")
 			integration_request_name = create_request_log(kwargs, service_name="Razorpay").name
@@ -398,9 +426,6 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 
 	def create_order(self, **kwargs):
 		# Creating Orders https://razorpay.com/docs/api/orders/
-		from razorpay_payment.gateway.client import get_razorpay_auth, to_minor_units
-		from razorpay_payment.gateway.constants import RAZORPAY_API_BASE
-		from razorpay_payment.gateway.references import get_razorpay_notes
 
 		currency = kwargs.get("currency") or "INR"
 		# Convert major units → minor (paise) for all non-zero-decimal currencies.
@@ -414,7 +439,7 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			"amount": kwargs.get("amount"),
 			"currency": currency,
 			"receipt": kwargs.get("receipt"),
-			"payment_capture": 1,
+			"payment_capture": kwargs.get("payment_capture") or 1,
 			"notes": get_razorpay_notes(kwargs, integration_request=integration_request.name),
 		}
 		if self.api_key and self.api_secret:
@@ -525,8 +550,6 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 				if custom_redirect_to:
 					redirect_to = custom_redirect_to
 
-			from razorpay_payment.gateway.references import success_redirect
-
 			redirect_url = success_redirect(
 				reference_doctype=self.data.reference_doctype,
 				reference_docname=self.data.reference_docname,
@@ -552,8 +575,6 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		return None
 
 	def settle_payment_request(self, pr, payment_id=None):
-		from razorpay_payment.gateway import settlement
-
 		return settlement.settle_payment_request(self, pr, payment_id=payment_id)
 
 	def on_trash(self):
@@ -568,10 +589,6 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		never from the client — so a signature minted for a different (cheaper)
 		order cannot settle this one.
 		"""
-		from razorpay_payment.gateway.client import (
-			verify_payment_signature,
-			verify_subscription_signature,
-		)
 
 		payment_id = self.data.get("razorpay_payment_id")
 		signature = self.data.get("razorpay_signature")
@@ -667,6 +684,10 @@ def capture_payment(is_sandbox=False, sanbox_response=None):
 				resp = sanbox_response
 			else:
 				data = json.loads(row.data)
+				# Subscription auth payments are captured automatically by Razorpay
+				# via the mandate; manual capture here conflicts with that and 400s.
+				if data.get("subscription_id"):
+					continue
 				settings = controller.get_settings(data)
 
 				resp = make_get_request(
@@ -849,7 +870,6 @@ def verify_callback_signature(raw_body, signature):
 	closed rather than silently accepting unsigned traffic) or when the
 	signature does not match.
 	"""
-	from razorpay_payment.gateway.client import verify_webhook_signature
 
 	# webhook_secret is a Password field, so decrypt it through the controller.
 	controller = frappe.get_doc("Razorpay Settings")

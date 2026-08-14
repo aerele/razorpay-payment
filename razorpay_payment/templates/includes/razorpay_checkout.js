@@ -6,8 +6,6 @@ $(document).ready(function(){
 			"currency": "{{ currency }}",
 			"name": "{{ title }}",
 			"description": "{{ description }}",
-			"subscription_id": "{{ subscription_id }}",
-			"order_id": "{{ order_id }}",
 			"handler": function (response){
 				razorpay.make_payment_log(response, options, "{{ reference_doctype }}", "{{ reference_docname }}", "{{ token }}");
 			},
@@ -17,6 +15,14 @@ $(document).ready(function(){
 			},
 			"notes": {{ frappe.form_dict|json }}
 		};
+
+		// Subscription auth payments are anchored on subscription_id, NOT order_id.
+		// Passing both confuses Razorpay's mandate processor — pass only one.
+		if ("{{ subscription_id }}") {
+			options["subscription_id"] = "{{ subscription_id }}";
+		} else if ("{{ order_id }}") {
+			options["order_id"] = "{{ order_id }}";
+		}
 
 		var rzp = new Razorpay(options);
 		rzp.open();

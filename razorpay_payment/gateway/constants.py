@@ -37,3 +37,50 @@ THREE_DECIMAL_CURRENCIES = {
 	"OMR",
 	"TND",
 }
+
+# Custom fields for subscription linkage.
+# Razorpay notes (max 15 string → string pairs) carry the ERPNext reference and
+# are the self-heal source until razorpay_subscription_id is stamped.
+# Subscription Plan.product_price_id (native field, not installed here) holds
+# the gateway plan id: Stripe writes price_xxx, Razorpay writes plan_xxx.
+RAZORPAY_CUSTOM_FIELDS = {
+	"Customer": [
+		{
+			"fieldname": "razorpay_customer_id",
+			"fieldtype": "Data",
+			"label": "Razorpay Customer ID",
+			"read_only": 1,
+			"no_copy": 1,
+			"print_hide": 1,
+			"search_index": 1,
+			"insert_after": "default_currency",
+			"module": "Razorpay",
+		}
+	],
+	"Subscription": [
+		{
+			"fieldname": "razorpay_subscription_id",
+			"fieldtype": "Data",
+			"label": "Razorpay Subscription ID",
+			"read_only": 1,
+			"no_copy": 1,
+			"print_hide": 1,
+			"search_index": 1,
+			"insert_after": "status",
+			"module": "Razorpay",
+		},
+	],
+	"Payment Entry": [
+		{
+			"fieldname": "razorpay_payment_id",
+			"fieldtype": "Data",
+			"label": "Razorpay Payment ID",
+			"read_only": 1,
+			"no_copy": 1,
+			"print_hide": 1,
+			"search_index": 1,
+			"insert_after": "reference_no",
+			"module": "Razorpay",
+		}
+	],
+}
