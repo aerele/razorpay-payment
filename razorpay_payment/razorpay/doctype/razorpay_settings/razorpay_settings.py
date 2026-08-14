@@ -74,6 +74,8 @@ from frappe.utils import call_hook_method, cint, get_timestamp, get_url
 from payment_core.api.gateway import GatewayControllerMixin
 from payment_core.utils import create_payment_gateway
 
+from razorpay_payment.gateway.webhooks import clear_webhook_secret_cache
+
 
 class RazorpaySettings(GatewayControllerMixin, Document):
 	supported_currencies = (
@@ -218,6 +220,15 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 	def validate(self):
 		create_payment_gateway("Razorpay")
 		call_hook_method("payment_gateway_enabled", gateway="Razorpay")
+		self.set_webhook_endpoint()
+
+	def set_webhook_endpoint(self):
+		"""Show the admin which URL to register as a Razorpay webhook endpoint."""
+		endpoint = get_url("/api/method/razorpay_payment.razorpay.doctype.razorpay_settings.webhooks")
+		if self.webhook_endpoint != endpoint:
+			self.db_set("webhook_endpoint", endpoint, update_modified=False)
+
+		clear_webhook_secret_cache()
 
 	@frappe.whitelist()
 	def test_credentials(self):
@@ -536,13 +547,17 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		if hasattr(ref, "on_payment_authorized"):
 			return ref.run_method("on_payment_authorized", self.flags.status_changed_to)
 		if ref.doctype == "Payment Request":
-			self.settle_payment_request(ref)
+			payment_id = self.data.get("razorpay_payment_id")
+			self.settle_payment_request(ref, payment_id=payment_id)
 		return None
 
-	def settle_payment_request(self, pr):
+	def settle_payment_request(self, pr, payment_id=None):
 		from razorpay_payment.gateway import settlement
 
-		return settlement.settle_payment_request(self, pr)
+		return settlement.settle_payment_request(self, pr, payment_id=payment_id)
+
+	def on_trash(self):
+		clear_webhook_secret_cache()
 
 	def verify_checkout_signature(self, data, settings):
 		"""Verify the Checkout success signature before settling anything.

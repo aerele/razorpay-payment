@@ -5,8 +5,14 @@ import frappe
 from frappe.utils import flt, nowdate
 
 
-def settle_payment_request(settings, pr):
-	"""Create a Payment Entry, allowing a second PE for partial payments."""
+def settle_payment_request(settings, pr, payment_id=None):
+	"""Create a Payment Entry, allowing a second PE for partial payments.
+
+	``payment_id`` (the Razorpay payment id, e.g. pay_xxx) is stamped onto the
+	PE's ``reference_no`` so the webhook's ledger-level dedupe and verification
+	can find it. Falls back to the PR name when no payment id is available
+	(e.g. the non-webhook settlement path).
+	"""
 	if pr.docstatus != 1 or pr.status == "Paid":
 		return
 
@@ -37,7 +43,7 @@ def settle_payment_request(settings, pr):
 			party_amount=flt(pr.outstanding_amount),
 			bank_account=pr.payment_account,
 		)
-		payment_entry.reference_no = pr.name
+		payment_entry.reference_no = payment_id or pr.name
 		payment_entry.reference_date = nowdate()
 		payment_entry.insert()
 		payment_entry.submit()
