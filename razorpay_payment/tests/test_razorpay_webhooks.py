@@ -193,5 +193,5 @@ class TestRazorpayWebhooks(FrappeTestCase):
 			sweep_pending()
 
 		apply_status.assert_called_once()
-		failed, _ = apply_status.call_args[0]
+		failed, _processed = apply_status.call_args[0]
 		self.assertIn("LOG-1", failed)

@@ -7,6 +7,8 @@ from frappe import _
 from frappe.utils import cint, flt
 from payment_core.utils import guard_payment_reference, validate_integration_request
 
+from razorpay_payment.gateway.references import assert_reference_payable
+
 no_cache = 1
 
 expected_keys = (
@@ -17,7 +19,6 @@ expected_keys = (
 	"reference_docname",
 	"payer_name",
 	"payer_email",
-	"order_id",
 	"currency",
 )
 
@@ -35,6 +36,10 @@ def get_context(context):
 
 		for key in expected_keys:
 			context[key] = payment_details[key]
+
+		# order_id is optional — absent for subscription auth payments (which use
+		# subscription_id as the checkout anchor instead).
+		context["order_id"] = payment_details.get("order_id") or ""
 
 		context["token"] = frappe.form_dict["token"]
 		guard_payment_reference(context["reference_doctype"], context["reference_docname"])
@@ -79,6 +84,7 @@ def make_payment(
 	guard_payment_reference(reference_doctype, reference_docname)
 	if frappe.session.user != "Guest":
 		frappe.has_permission(reference_doctype, "read", reference_docname, throw=True)
+	assert_reference_payable(reference_doctype, reference_docname)
 
 	data = {}
 

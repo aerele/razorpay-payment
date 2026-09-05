@@ -8,18 +8,31 @@ app_license = "mit"
 # Depends on the shared base app.
 required_apps = ["payment_core"]
 
-# Register the Razorpay service module with payment_core's gateway registry.
+# Gateway registry for payment_core.
 payment_gateway_module = {"Razorpay": "razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings"}
 
-# Capture authorized-but-uncaptured payments hourly. The manual-capture window is
-# measured in hours, so sub-minute cadence (scheduler_events["all"]) was wasteful;
-# capture_payment also early-exits on a cheap COUNT when nothing is pending.
+# Subscription create handler for payment_core's dispatcher.
+gateway_subscription_handler = {
+	"razorpay": "razorpay_payment.gateway.subscriptions.create_razorpay_subscription",
+}
+
+# Sync Razorpay plan on save (on_update so outages don't block saves).
+doc_events = {
+	"Subscription Plan": {"on_update": "razorpay_payment.gateway.subscriptions.sync_razorpay_plan"},
+}
+
+# Hourly: capture authorized payments + retry failed webhooks.
 scheduler_events = {
 	"hourly": [
 		"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.capture_payment",
 		"razorpay_payment.gateway.reconciliation.sweep_pending",
 	],
 }
+
+# Custom field lifecycle.
+after_install = "razorpay_payment.install.after_install"
+before_uninstall = "razorpay_payment.install.before_uninstall"
+after_migrate = ["razorpay_payment.install.after_install"]
 
 add_to_apps_screen = [
 	{

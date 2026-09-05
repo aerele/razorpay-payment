@@ -384,6 +384,7 @@ class TestMakePaymentCheckout(FrappeTestCase):
 		fake_session.user = "user@example.com"
 		with (
 			patch.object(page, "guard_payment_reference") as gpr,
+			patch.object(page, "assert_reference_payable"),
 			patch("razorpay_payment.templates.pages.razorpay_checkout.frappe.session", fake_session),
 			patch("razorpay_payment.templates.pages.razorpay_checkout.frappe.has_permission"),
 			patch("razorpay_payment.templates.pages.razorpay_checkout.frappe.get_doc"),

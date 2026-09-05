@@ -15,6 +15,9 @@ def settle_payment_request(settings, pr, payment_id=None):
 	"""
 	if pr.docstatus != 1 or pr.status == "Paid":
 		return
+	if getattr(pr, "payment_channel", None) == "Phone":
+		pr.db_set({"status": "Paid", "outstanding_amount": 0})
+		return
 
 	from payment_core.utils import erpnext_app_import_guard
 
@@ -45,6 +48,8 @@ def settle_payment_request(settings, pr, payment_id=None):
 		)
 		payment_entry.reference_no = payment_id or pr.name
 		payment_entry.reference_date = nowdate()
+		if payment_id and payment_entry.meta.has_field("razorpay_payment_id"):
+			payment_entry.razorpay_payment_id = payment_id
 		payment_entry.insert()
 		payment_entry.submit()
 	finally:
