@@ -39,7 +39,7 @@ add_to_apps_screen = [
 		"name": "razorpay_payment",
 		"logo": "/assets/razorpay_payment/images/razorpay_payment-logo.svg",
 		"title": "Razorpay Payment",
-		"route": "/app",
+		"route": "/desk/razorpay-settings",
 	}
 ]
 
