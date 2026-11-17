@@ -11,6 +11,15 @@ required_apps = ["payment_core"]
 # Gateway registry for payment_core.
 payment_gateway_module = {"Razorpay": "razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings"}
 
+# Declares our settings form to payment_core's "Add Gateway" picker, so a
+# fresh site can reach Razorpay Settings before the first save registers a
+# Payment Gateway row.
+payment_gateway_settings_doctypes = ["Razorpay Settings"]
+
+# No add_to_apps_screen: gateways are payment_core plugins, configured from
+# the Payment Core workspace (Gateway Settings hub / analytics dashboard).
+# Sites on the "Desktop Icons" grid get their seeded tile removed by a patch.
+
 # Subscription create handler for payment_core's dispatcher.
 gateway_subscription_handler = {
 	"razorpay": "razorpay_payment.gateway.subscriptions.create_razorpay_subscription",
@@ -33,14 +42,5 @@ scheduler_events = {
 after_install = "razorpay_payment.install.after_install"
 before_uninstall = "razorpay_payment.install.before_uninstall"
 after_migrate = ["razorpay_payment.install.after_install"]
-
-add_to_apps_screen = [
-	{
-		"name": "razorpay_payment",
-		"logo": "/assets/razorpay_payment/images/razorpay_payment-logo.svg",
-		"title": "Razorpay Payment",
-		"route": "/desk/razorpay-settings",
-	}
-]
 
 export_python_type_annotations = True
