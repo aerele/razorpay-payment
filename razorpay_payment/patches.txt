@@ -2,3 +2,4 @@
 
 [post_model_sync]
 razorpay_payment.patches.reassign_razorpay_modules
+razorpay_payment.patches.remove_desktop_icon
