@@ -1,56 +1,22 @@
 # Copyright (c) Frappe Technologies Pvt. Ltd. and contributors
-# License: MIT. See LICENSE
+# License: MIT
+#
+# Payment Request settlement: delegated to payment_core's own builder
+# (created_from_payment_request=True allocation, mode of payment, charged
+# amount via the controller, partial-charge handling), with the Razorpay
+# payment id stamped onto the Payment Entry through annotate_payment_entry.
 
 import frappe
-from frappe.utils import flt, nowdate
+from payment_core.utils import settle_payment_request as core_settle_payment_request
 
 
 def settle_payment_request(settings, pr, payment_id=None):
-	"""Create a Payment Entry, allowing a second PE for partial payments.
+	"""Settle a Payment Request through payment_core's builder.
 
-	``payment_id`` (the Razorpay payment id, e.g. pay_xxx) is stamped onto the
-	PE's ``reference_no`` so the webhook's ledger-level dedupe and verification
-	can find it. Falls back to the PR name when no payment id is available
-	(e.g. the non-webhook settlement path).
+	``payment_id`` (the Razorpay payment id, e.g. pay_xxx) reaches the
+	builder via the controller flags: ``get_charged_amount`` uses it to
+	report the actual charge, and ``annotate_payment_entry`` stamps it onto
+	the booked Payment Entry's ``reference_no`` for webhook dedupe.
 	"""
-	if pr.docstatus != 1 or pr.status == "Paid":
-		return
-	if getattr(pr, "payment_channel", None) == "Phone":
-		pr.db_set({"status": "Paid", "outstanding_amount": 0})
-		return
-
-	from payment_core.utils import erpnext_app_import_guard
-
-	with erpnext_app_import_guard():
-		from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
-		from erpnext.accounts.doctype.payment_request.payment_request import (
-			get_existing_payment_entry,
-		)
-
-	# Allow a second PE while the reference doc is still owed (Sales Orders have no
-	# outstanding_amount, so the guard is skipped for them).
-	if pr.reference_name and get_existing_payment_entry(pr.reference_name):
-		if frappe.get_meta(pr.reference_doctype).has_field("outstanding_amount"):
-			si_outstanding = flt(
-				frappe.db.get_value(pr.reference_doctype, pr.reference_name, "outstanding_amount")
-			)
-			if si_outstanding <= 0:
-				return
-
-	original_user = frappe.session.user
-	try:
-		frappe.set_user("Administrator")  # nosemgrep
-		payment_entry = get_payment_entry(
-			pr.reference_doctype,
-			pr.reference_name,
-			party_amount=flt(pr.outstanding_amount),
-			bank_account=pr.payment_account,
-		)
-		payment_entry.reference_no = payment_id or pr.name
-		payment_entry.reference_date = nowdate()
-		if payment_id and payment_entry.meta.has_field("razorpay_payment_id"):
-			payment_entry.razorpay_payment_id = payment_id
-		payment_entry.insert()
-		payment_entry.submit()
-	finally:
-		frappe.set_user(original_user)  # nosemgrep
+	settings.flags.razorpay_payment_id = payment_id
+	return core_settle_payment_request(pr, controller=settings)

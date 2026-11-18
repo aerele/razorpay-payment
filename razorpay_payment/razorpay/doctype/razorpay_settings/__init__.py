@@ -22,6 +22,8 @@ def webhooks():
 		return
 	raw_body = r.get_data()
 	signature = frappe.get_request_header("X-Razorpay-Signature")
+	# Razorpay's delivery id: the body carries no event id, so the header is
+	# the dedupe key
 	event_id = frappe.get_request_header("X-Razorpay-Event-ID")
 
 	event = construct_event(raw_body, signature)
@@ -33,6 +35,6 @@ def webhooks():
 	original_user = frappe.session.user
 	try:
 		frappe.set_user("Administrator")  # nosemgrep
-		return handle_event(raw_body, event_id, settings)
+		return handle_event(event, settings, event_id=event_id)
 	finally:
 		frappe.set_user(original_user)  # nosemgrep

@@ -252,28 +252,37 @@ class TestCapturePaymentScheduler(FrappeTestCase):
 				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.get_all"
 			) as ga,
 			patch(
-				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.db.sql"
-			) as sql,
+				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.qb.update"
+			) as update,
 		):
 			capture_payment()
 		# Controller loads once; COUNT guard returns 0; no get_all, no UPDATEs.
 		self.assertEqual(gd.call_count, 1)
 		cnt.assert_called_once()
 		ga.assert_not_called()
-		sql.assert_not_called()
+		update.assert_not_called()
 
 	def test_capture_payment_uses_bulk_update(self):
 		"""W4: one UPDATE per status bucket, not one set_value per row."""
 		rows = [
-			MagicMock(name=f"IR-{i}", data=json.dumps({"razorpay_payment_id": f"pay_{i}"})) for i in range(3)
+			frappe._dict(name=f"IR-{i}", data=json.dumps({"razorpay_payment_id": f"pay_{i}"}))
+			for i in range(3)
 		]
 		settings_mock = MagicMock()
+		settings_mock.flags = frappe._dict()
 		settings_mock.get_settings.return_value = MagicMock(api_key="k", api_secret="s")
+		query = MagicMock()
+		query.set.return_value = query
+		query.where.return_value = query
 
 		with (
 			patch(
 				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.get_doc",
 				return_value=settings_mock,
+			),
+			patch(
+				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.db.count",
+				return_value=len(rows),
 			),
 			patch(
 				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.get_all",
@@ -288,23 +297,34 @@ class TestCapturePaymentScheduler(FrappeTestCase):
 				return_value={"status": "captured"},
 			),
 			patch(
-				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.db"
-			) as db_mock,
+				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.ledger.sync_payment_transaction"
+			) as sync_transaction,
+			patch(
+				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.qb.update",
+				return_value=query,
+			) as update,
+			patch(
+				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.db.savepoint"
+			),
+			patch(
+				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.db.release_savepoint"
+			),
+			patch("razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.db.rollback"),
+			patch(
+				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.log_error"
+			) as log_error,
 		):
-			db_mock.savepoint = MagicMock()
-			db_mock.release_savepoint = MagicMock()
-			db_mock.rollback = MagicMock()
-			db_mock.sql = MagicMock()
 			capture_payment()
 
 		# Bulk captured UPDATE ran exactly once with all 3 names.
-		captured_calls = [
-			c for c in db_mock.sql.call_args_list if "Completed" in str(c) or "'Completed'" in str(c)
-		]
-		self.assertEqual(len(captured_calls), 1, f"expected 1 captured UPDATE, got {captured_calls}")
-		# Names were passed as a tuple of all 3.
-		names_arg = captured_calls[0].args[1]["names"]
-		self.assertEqual(len(names_arg), 3)
+		self.assertEqual(settings_mock.authorize_reference.call_count, 3)
+		self.assertEqual(sync_transaction.call_count, 3)
+		log_error.assert_not_called()
+		update.assert_called_once()
+		query.run.assert_called_once()
+		criterion = str(query.where.call_args.args[0])
+		for name in ("IR-0", "IR-1", "IR-2"):
+			self.assertIn(name, criterion)
 
 
 class TestTestCredentialsButton(FrappeTestCase):
