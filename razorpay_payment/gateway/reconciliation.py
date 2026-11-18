@@ -4,6 +4,7 @@
 # Maps verified Razorpay webhook events onto ERPNext records; each handler is idempotent.
 
 import json
+import re
 from datetime import datetime, timezone
 
 import frappe
@@ -11,10 +12,17 @@ from frappe import _
 from frappe.integrations.utils import make_get_request
 from frappe.utils import cint, flt, getdate, now_datetime, nowdate
 from payment_core.utils import erpnext_app_import_guard
+from payment_core.webhooks import mark_failed, mark_processed
 
 from razorpay_payment.gateway.client import from_minor_units, get_razorpay_auth
 from razorpay_payment.gateway.constants import RAZORPAY_API_BASE
+from razorpay_payment.gateway.ledger import (
+	sync_payment_transaction,
+)
 from razorpay_payment.gateway.subscriptions import link_razorpay_subscription
+
+MAX_SWEEP_RETRIES = 5
+SWEEP_ATTEMPT_RE = re.compile(r"^sweep attempt (\d+):")
 
 
 def route_event(event, settings):
@@ -61,15 +69,31 @@ def reconcile_payment_captured(event, settings):  # dispatched via _HANDLERS
 	if not reference_doctype or not reference_docname:
 		return {"status_label": "Ignored"}
 
+	# Order notes are the authoritative mode signal. ERPNext may have the
+	# Payment Transaction table when force_payment_ledger is enabled, and a
+	# plain-Frappe test site may have other accounting doctypes installed.
+	if notes.get("payment_transaction"):
+		sync_payment_transaction(
+			{"payment_transaction": notes.get("payment_transaction")},
+			"Paid",
+			provider_transaction_id=payment_id,
+			metadata={"razorpay_payment_id": payment_id},
+		)
+		return {
+			"status_label": "Processed",
+			"reference_doctype": reference_doctype,
+			"reference_name": reference_docname,
+		}
+
 	# De-dupe at the ledger level: one Payment Entry per Razorpay payment id.
 	if frappe.db.exists("Payment Entry", {"reference_no": payment_id, "docstatus": 1}):
 		return {"status_label": "Ignored"}
 
 	ref = frappe.get_doc(reference_doctype, reference_docname)
-	if hasattr(ref, "on_payment_authorized"):
-		ref.run_method("on_payment_authorized", "Completed")
-	elif ref.doctype == "Payment Request":
+	if ref.doctype == "Payment Request":
 		settings.settle_payment_request(ref, payment_id=payment_id)
+	elif hasattr(ref, "on_payment_authorized"):
+		ref.run_method("on_payment_authorized", "Completed")
 
 	# Verify settlement actually produced a Payment Entry. If it silently failed,
 	# throw an error so the webhook savepoint rolls back and marks the log Failed.
@@ -84,7 +108,7 @@ def reconcile_payment_captured(event, settings):  # dispatched via _HANDLERS
 
 
 def mark_payment_failed(event, settings):  # dispatched via _HANDLERS
-	"""payment.failed — comment on the reference linked via the ORDER's notes."""
+	"""payment.failed — fail the ledger transaction and comment on the order-bound reference."""
 	payment_entity = event.get("payload", {}).get("payment", {}).get("entity", {})
 	order_id = payment_entity.get("order_id")
 
@@ -97,10 +121,17 @@ def mark_payment_failed(event, settings):  # dispatched via _HANDLERS
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), "Razorpay order lookup failed")
 
+	sync_payment_transaction(
+		{"payment_transaction": notes.get("payment_transaction")},
+		"Failed",
+		error_message=payment_entity.get("error_description") or _("Razorpay payment failed"),
+		metadata={"razorpay_payment_id": payment_entity.get("id")},
+	)
+
 	reference_doctype = notes.get("reference_doctype")
 	reference_docname = notes.get("reference_docname")
 
-	if reference_doctype and reference_docname:
+	if reference_doctype and reference_docname and frappe.db.exists(reference_doctype, reference_docname):
 		doc = frappe.get_doc(reference_doctype, reference_docname)
 		doc.add_comment(
 			"Comment",
@@ -113,57 +144,72 @@ def mark_payment_failed(event, settings):  # dispatched via _HANDLERS
 
 
 def sweep_pending():
-	"""Hourly retry sweep for Failed webhook events (max 5 retries, batch of 50)."""
-	MAX_RETRIES = 5
+	"""Scheduler: retry webhook events that failed processing.
+
+	Uses payment_core's shared Payment Webhook Log (the active log). Each run
+	loads a bounded batch of Failed Razorpay rows (oldest first, so permanently
+	failing rows can't starve newer ones of batch slots), re-runs the processor
+	in a savepoint, and records the outcome via mark_processed / mark_failed.
+	A row that keeps failing leaves the retry pool after MAX_SWEEP_RETRIES
+	attempts.
+	"""
 	batch_size = cint(frappe.conf.get("razorpay_webhook_sweep_batch_size")) or 50
 
 	try:
-		failed_logs = frappe.get_all(
-			"Razorpay Webhook Log",
-			filters={"status": "Failed", "retry_count": ("<", MAX_RETRIES)},
-			fields=["name", "razorpay_settings", "payload", "retry_count"],
-			limit=batch_size,
+		rows = (
+			frappe.get_all(
+				"Payment Webhook Log",
+				filters={"status": "Failed", "source": ("like", "Razorpay%")},
+				fields=["name", "payload", "event_type", "error"],
+				order_by="creation asc",
+				limit=batch_size,
+			)
+			if frappe.db.table_exists("Payment Webhook Log")
+			else []
 		)
 	except Exception:
-		frappe.log_error(frappe.get_traceback(), "Razorpay webhook sweep failed")
+		frappe.log_error(frappe.get_traceback(), "Razorpay webhook sweep could not load pending events")
 		return
 
-	if not failed_logs:
-		return
-
-	settings_cache = {}
-	failed = []
-	processed = {}
-
-	for row in failed_logs:
+	settings = None
+	for row in rows:
 		frappe.db.savepoint("razorpay_webhook_sweep_row")
 		try:
-			event = json.loads(row.payload)
-			settings = settings_cache.get(row.razorpay_settings) or frappe.get_doc(
-				"Razorpay Settings", row.razorpay_settings
+			event = frappe.parse_json(row.payload)
+			settings = settings or frappe.get_doc("Razorpay Settings", "Razorpay Settings")
+			result = route_event(event, settings) or {}
+			mark_processed(
+				row.name,
+				status=result.get("status_label", "Processed"),
 			)
-			settings_cache[row.razorpay_settings] = settings
-
-			status_label = (route_event(event, settings) or {}).get("status_label", "Processed")
-			processed.setdefault(status_label, []).append(row.name)
 		except Exception:
 			frappe.db.rollback(save_point="razorpay_webhook_sweep_row")
-			frappe.log_error(frappe.get_traceback(), "Razorpay webhook sweep row failed")
-			failed.append(row.name)
+			frappe.log_error(frappe.get_traceback(), "Razorpay webhook sweep failed")
+			attempt_no = get_sweep_attempt(row.get("error"))
+			if attempt_no + 1 >= MAX_SWEEP_RETRIES:
+				# this sweep was the last allowed attempt: leave the retry pool
+				# (mark_failed keeps the row Failed) with the reason recorded
+				frappe.db.set_value(
+					"Payment Webhook Log",
+					row.name,
+					{"status": "Ignored", "error": f"sweep gave up after {attempt_no + 1} attempts"},
+					update_modified=False,
+				)
+			else:
+				mark_failed(row.name, f"sweep attempt {attempt_no + 1}: {frappe.get_traceback()[:200]}")
 
-	_apply_sweep_status(failed, processed)
+
+def get_sweep_attempt(error):
+	"""Return the durable sweep attempt count encoded in a log error."""
+	match = SWEEP_ATTEMPT_RE.match(error or "")
+	return cint(match.group(1)) if match else 0
 
 
-def _apply_sweep_status(failed, processed):
-	"""Bulk-update sweep outcomes: failed rows increment retry_count, processed rows set status."""
-	log = frappe.qb.DocType("Razorpay Webhook Log")
-	if failed:
-		frappe.qb.update(log).set(log.status, "Failed").set(log.retry_count, log.retry_count + 1).where(
-			log.name.isin(failed)
-		).run()
-	for status_label, names in processed.items():
-		if names:
-			frappe.qb.update(log).set(log.status, status_label).where(log.name.isin(names)).run()
+def preserve_sweep_attempt(previous_error, error):
+	"""Keep the sweep count when a manual desk retry writes a new error."""
+	attempt = get_sweep_attempt(previous_error)
+	prefix = f"sweep attempt {attempt}: " if attempt else ""
+	return f"{prefix}{error}"
 
 
 def reconcile_subscription_charged(event, settings):  # dispatched via _HANDLERS

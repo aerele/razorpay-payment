@@ -59,6 +59,7 @@ For razorpay payment status is Authorized
 
 """
 
+import hashlib
 import json
 from urllib.parse import urlencode
 
@@ -70,12 +71,23 @@ from frappe.integrations.utils import (
 	make_post_request,
 )
 from frappe.model.document import Document
-from frappe.utils import call_hook_method, cint, get_timestamp, get_url
+from frappe.utils import call_hook_method, cint, flt, get_datetime, get_timestamp, get_url, now_datetime
 from payment_core.api.gateway import GatewayControllerMixin
-from payment_core.utils import create_payment_gateway, get_reference_amount, guard_payment_reference
+from payment_core.payment_ledger.status_flow import PaymentTransactionStatus
+from payment_core.utils import (
+	create_payment_gateway,
+	elevated_user,
+	get_amount_precision,
+	get_reference_amount,
+	guard_payment_reference,
+	initiate_transaction,
+)
+from payment_core.webhooks import mark_failed, mark_processed
+from razorpay.errors import BadRequestError
 
-from razorpay_payment.gateway import settlement
+from razorpay_payment.gateway import ledger, reconciliation, settlement
 from razorpay_payment.gateway.client import (
+	from_minor_units,
 	get_razorpay_auth,
 	get_razorpay_client,
 	to_minor_units,
@@ -92,7 +104,54 @@ from razorpay_payment.gateway.references import (
 	success_redirect,
 )
 from razorpay_payment.gateway.subscriptions import create_razorpay_subscription
-from razorpay_payment.gateway.webhooks import clear_webhook_secret_cache
+from razorpay_payment.gateway.webhooks import clear_webhook_secret_cache, get_webhook_secret
+
+REFUND_RECEIPT_MAX_LENGTH = 40
+REFUND_PAGE_SIZE = 100
+SETTLEMENT_CLAIM_TTL_SECONDS = 10 * 60
+
+
+def _refund_receipt(idempotency_key):
+	"""Fit payment_core's stable key into Razorpay's receipt field."""
+	if not idempotency_key:
+		return None
+	key = str(idempotency_key)
+	if len(key) <= REFUND_RECEIPT_MAX_LENGTH:
+		return key
+	digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+	return f"{key[: REFUND_RECEIPT_MAX_LENGTH - len(digest) - 1]}-{digest}"
+
+
+def _refund_header_key(idempotency_key):
+	"""Return a Razorpay-safe refund idempotency header value."""
+	digest = hashlib.sha256(str(idempotency_key).encode()).hexdigest()[:32]
+	return f"pc-refund-{digest}"
+
+
+def _find_refund_by_receipt(client, payment_id, receipt):
+	"""Resolve the existing refund after Razorpay rejects a duplicate receipt."""
+	skip = 0
+	while True:
+		params = {"count": REFUND_PAGE_SIZE}
+		if skip:
+			params["skip"] = skip
+		response = client.payment.fetch_multiple_refund(payment_id, params) or {}
+		items = response.get("items", [])
+		refund = next((item for item in items if item.get("receipt") == receipt), None)
+		if refund or len(items) < REFUND_PAGE_SIZE:
+			return refund
+		skip += REFUND_PAGE_SIZE
+
+
+def _settlement_claim_is_active(started_at):
+	"""Return whether a persisted settlement claim is still within its lease."""
+	if not started_at:
+		return False
+	try:
+		age = (now_datetime() - get_datetime(started_at)).total_seconds()
+	except (TypeError, ValueError):
+		return False
+	return age <= SETTLEMENT_CLAIM_TTL_SECONDS
 
 
 class RazorpaySettings(GatewayControllerMixin, Document):
@@ -403,11 +462,50 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 				if currency:
 					kwargs["currency"] = currency
 
+		# Shared-ledger sites: create (or reuse) the Payment Transaction first —
+		# its outstanding_amount is the amount authority for retried/partial
+		# payments. Gateway-only sites get None back and skip every sync.
+		ledger_available = frappe.db.table_exists("Payment Transaction")
+		if not ledger_available:
+			# A caller may pass a transaction name even on an ERPNext-only site.
+			# Do not persist a ledger-only binding that webhook routing cannot read.
+			kwargs.pop("payment_transaction", None)
+		payment_transaction_supplied = bool(kwargs.get("payment_transaction"))
+		ledger.ensure_payment_transaction(self, kwargs)
+		if kwargs.get("payment_transaction") and ledger_available:
+			txn = frappe.db.get_value(
+				"Payment Transaction",
+				kwargs["payment_transaction"],
+				["outstanding_amount", "reference_doctype", "reference_docname", "currency", "status"],
+				as_dict=True,
+			)
+			if payment_transaction_supplied and not txn:
+				frappe.throw(_("Payment Transaction does not exist."))
+			if payment_transaction_supplied and txn.status not in (*PaymentTransactionStatus.OPEN, "Failed"):
+				frappe.throw(_("Only an open or Failed Payment Transaction can start a new checkout."))
+			if txn and (txn.reference_doctype, txn.reference_docname) == (
+				reference_doctype,
+				reference_docname,
+			):
+				kwargs["amount"] = txn.outstanding_amount
+				if txn.currency:
+					kwargs["currency"] = txn.currency
+			elif txn:
+				frappe.throw(_("Payment Transaction does not belong to this reference."))
+
 		# Subscription references branch to the Razorpay Subscription create flow
 		# (POST /v1/subscriptions → short_url) instead of the one-off Order flow.
 		if is_subscription_reference(kwargs):
 			# create_razorpay_subscription needs a plain dict, not kwargs.
-			return create_razorpay_subscription(self.name, kwargs)
+			checkout_url = create_razorpay_subscription(self.name, kwargs)
+			ledger.sync_payment_transaction(
+				kwargs,
+				None if payment_transaction_supplied else "Initiated",
+				checkout_url=checkout_url,
+			)
+			if not payment_transaction_supplied and kwargs.get("payment_transaction"):
+				initiate_transaction(kwargs["payment_transaction"])
+			return checkout_url
 
 		# Always create a fresh server-side order: a caller-supplied order_id
 		# would let the client name which order the buyer pays for. The caller's
@@ -419,7 +517,22 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		# create_order already logged the Integration Request; only its name is
 		# needed here to build the checkout URL — read the scalar directly.
 		integration_request_name = order["integration_request"]
-		return get_url(f"./razorpay_checkout?token={integration_request_name}")
+		checkout_url = get_url(f"./razorpay_checkout?token={integration_request_name}")
+
+		# ledger sync: the order id is the provider handle while the payment is
+		# open; the checkout URL lets the desk/list re-share the link
+		ledger.sync_payment_transaction(
+			kwargs,
+			None if payment_transaction_supplied else "Initiated",
+			provider_transaction_id=kwargs.get("order_id"),
+			checkout_url=checkout_url,
+			metadata={"razorpay_order_id": kwargs.get("order_id")},
+		)
+		# checkout-first origin: the transaction was created as Draft above;
+		# submit it now that its checkout URL exists (idempotent, elevated)
+		if not payment_transaction_supplied and kwargs.get("payment_transaction"):
+			initiate_transaction(kwargs["payment_transaction"])
+		return checkout_url
 
 	def create_order(self, **kwargs):
 		# Creating Orders https://razorpay.com/docs/api/orders/
@@ -461,6 +574,7 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 
 	def create_request(self, data):
 		self.data = frappe._dict(data)
+		self._settlement_claimed = False
 
 		try:
 			self.integration_request = frappe.get_doc("Integration Request", self.data.token)
@@ -472,32 +586,13 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			if not (stored.get("order_id") or stored.get("subscription_id")):
 				frappe.throw(_("Invalid payment token."), frappe.ValidationError)
 
-			# A settled token is a no-op: check BEFORE update_status resets
-			# the status to "Queued". Lock the row so two concurrent requests
-			# cannot both pass the check and both settle.
-			IntegrationRequest = frappe.qb.DocType("Integration Request")
-			locked_status = (
-				frappe.qb.from_(IntegrationRequest)
-				.select(IntegrationRequest.status)
-				.where(IntegrationRequest.name == self.integration_request.name)
-				.for_update()
-				.run()
-			)
-			if locked_status and locked_status[0][0] in ("Completed", "Authorized"):
+			if not self._claim_settlement(self.data, status="Queued"):
 				return {"redirect_to": "payment-success", "status": 200}
-
-			# Never let client params overwrite server-stored checkout binding
-			# fields (what is being paid, for how much, against which reference).
-			params = merge_checkout_params(stored, self.data)
-			params.pop("token", None)
-			self.integration_request.update_status(params, "Queued")
-
-			# Settlement reads the stored data — never the browser's copy
-			self.data = frappe._dict(json.loads(self.integration_request.data))
 
 			return self.authorize_payment()
 
 		except Exception:
+			self._release_settlement_claim()
 			frappe.log_error(frappe.get_traceback())
 			return {
 				"redirect_to": frappe.redirect_to_message(
@@ -516,6 +611,10 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		until it is explicitly captured by merchant.
 		"""
 		data = json.loads(self.integration_request.data)
+		# settlement (reference, ledger transaction, amounts) reads the stored
+		# Integration Request data — never request values. The request's result
+		# keys (razorpay_payment_id/signature) were merged into it above.
+		self.data = frappe._dict(data)
 		settings = self.get_settings(data)
 
 		# a completed token is settled: replays (page refreshes, a second
@@ -528,10 +627,14 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			self.integration_request.db_set(
 				"error", _("Razorpay checkout signature verification failed."), update_modified=False
 			)
+			ledger.sync_payment_transaction(
+				self.data, "Failed", error_message=_("Razorpay checkout signature verification failed.")
+			)
 			frappe.log_error(
 				title="Razorpay signature verification failed",
 				message=f"Integration Request: {self.integration_request.name}",
 			)
+			self._release_settlement_claim()
 			return {"redirect_to": "payment-failed", "status": 401}
 
 		resp = {}
@@ -550,6 +653,7 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 					title="Razorpay payment mismatch",
 					message=f"Integration Request: {self.integration_request.name}",
 				)
+				self._release_settlement_claim()
 				return {"redirect_to": "payment-failed", "status": 401}
 
 			if resp.get("status") == "authorized":
@@ -574,13 +678,22 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 
 		except Exception:
 			frappe.log_error()
+			self._release_settlement_claim()
 
 		status = frappe.flags.integration_request.status_code
 
 		redirect_to = data.get("redirect_to") or None
 		redirect_message = data.get("redirect_message") or None
 		if self.flags.status_changed_to in ("Authorized", "Verified", "Completed"):
-			if self.data.reference_doctype and self.data.reference_docname:
+			# Settle a captured reference before the Paid sync. authorize_reference
+			# claims Payment Transaction.reference_authorized after the handler;
+			# the Paid sync then sees the same flag and cannot dispatch it again.
+			# Authorized payments stay Initiated and wait for capture.
+			if (
+				self.flags.status_changed_to == "Completed"
+				and self.data.reference_doctype
+				and self.data.reference_docname
+			):
 				custom_redirect_to = None
 				try:
 					frappe.flags.data = data
@@ -591,11 +704,19 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 				if custom_redirect_to:
 					redirect_to = custom_redirect_to
 
+			ledger.sync_payment_transaction(
+				self.data,
+				"Paid" if self.flags.status_changed_to == "Completed" else "Initiated",
+				provider_transaction_id=self.data.get("razorpay_payment_id"),
+				metadata={"razorpay_payment_id": self.data.get("razorpay_payment_id")},
+			)
+
 			redirect_url = success_redirect(
 				reference_doctype=self.data.reference_doctype,
 				reference_docname=self.data.reference_docname,
 			)
 		else:
+			self._release_settlement_claim()
 			redirect_url = "payment-failed"
 
 		if redirect_to:
@@ -628,17 +749,245 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		return False
 
 	def authorize_reference(self):
-		"""Settle the paid reference document via the partial-aware settler."""
+		"""Settle the paid reference document via the partial-aware settler.
+
+		Payment Requests settle through payment_core's builder with this
+		controller (mode of payment, charged amount, provider stamps);
+		everything else goes to payment_core's generic settler, which
+		duck-types own-flow references first and settles mapped references on
+		shared-ledger sites. Exactly-once: the callback, webhook and success
+		page can all land for one payment — only the first settles.
+		"""
+		if self._reference_already_authorized():
+			return None
 		ref = frappe.get_doc(self.data.reference_doctype, self.data.reference_docname)
-		if hasattr(ref, "on_payment_authorized"):
-			return ref.run_method("on_payment_authorized", self.flags.status_changed_to)
 		if ref.doctype == "Payment Request":
 			payment_id = self.data.get("razorpay_payment_id")
-			self.settle_payment_request(ref, payment_id=payment_id)
-		return None
+			self.flags.razorpay_payment_id = payment_id
+			result = self.settle_payment_request(ref, payment_id=payment_id)
+		else:
+			result = ledger.settle_ledger_reference(self.data, self.flags.status_changed_to)
+		self._mark_reference_authorized()
+		return result
+
+	def _reference_already_authorized(self):
+		"""True when the shared Payment Transaction settled its reference.
+
+		All completion paths use this one flag: callback, webhook, and success
+		page reconciliation cannot maintain independent settlement state.
+		"""
+		transaction_name = self.data.get("payment_transaction")
+		return bool(
+			transaction_name
+			and frappe.db.table_exists("Payment Transaction")
+			and frappe.db.get_value("Payment Transaction", transaction_name, "reference_authorized")
+		)
+
+	def _mark_reference_authorized(self):
+		transaction_name = self.data.get("payment_transaction")
+		if transaction_name and frappe.db.table_exists("Payment Transaction"):
+			frappe.db.set_value(
+				"Payment Transaction", transaction_name, "reference_authorized", 1, update_modified=False
+			)
+
+	def get_charged_amount(self, pr):
+		"""What Razorpay actually charged for this request, in major units.
+
+		payment_core's Payment Request builder asks the controller for the
+		charged amount so a partial charge books a partial Payment Entry.
+		Unknown (None) lets the builder settle the outstanding instead.
+		"""
+		data = getattr(self, "data", None) or {}
+		flags = getattr(self, "flags", None) or {}
+		payment_id = flags.get("razorpay_payment_id") or data.get("razorpay_payment_id")
+		if not payment_id or not str(payment_id).startswith("pay_"):
+			return None
+		try:
+			api_key, api_secret = get_razorpay_auth(self)
+			resp = make_get_request(f"{RAZORPAY_API_BASE}/payments/{payment_id}", auth=(api_key, api_secret))
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "Razorpay charged amount lookup failed")
+			return None
+		return from_minor_units(resp.get("amount"), resp.get("currency"))
+
+	def annotate_payment_entry(self, payment_entry, pr):
+		"""Stamp the provider payment id onto the booked Payment Entry.
+
+		Called by payment_core's builder after submit: ``reference_no``
+		carries the Razorpay payment id so the webhook's ledger-level dedupe
+		and verification can find the entry.
+		"""
+		data = getattr(self, "data", None) or {}
+		flags = getattr(self, "flags", None) or {}
+		payment_id = flags.get("razorpay_payment_id") or data.get("razorpay_payment_id")
+		if not payment_id:
+			return
+		updates = {"reference_no": payment_id}
+		if payment_entry.meta.has_field("razorpay_payment_id"):
+			updates["razorpay_payment_id"] = payment_id
+		frappe.db.set_value("Payment Entry", payment_entry.name, updates, update_modified=False)
 
 	def settle_payment_request(self, pr, payment_id=None):
 		return settlement.settle_payment_request(self, pr, payment_id=payment_id)
+
+	def is_webhook_configured(self):
+		"""Structured webhook signal for payment_core (language-safe).
+
+		Consumers must not match get_health_warnings() text — it is
+		translated. This reports the signing-secret fact directly.
+		"""
+		return bool(get_webhook_secret())
+
+	def get_health_warnings(self):
+		"""Setup gaps that would destabilise settlement in production."""
+		warnings = []
+		if not self.webhook_secret:
+			warnings.append(_("Webhook signing secret is not configured on {0}").format(self.name))
+		if not self.webhook_endpoint:
+			warnings.append(_("Webhook endpoint is not registered on {0}").format(self.name))
+		return warnings
+
+	def process_webhook_log(self, log_name):
+		"""Re-run the processor for a Failed Payment Webhook Log row (desk retry)."""
+		log = frappe.get_doc("Payment Webhook Log", log_name)
+		event = frappe.parse_json(log.payload) if log.payload else None
+		if not event:
+			mark_failed(log_name, reconciliation.preserve_sweep_attempt(log.error, "empty payload"))
+			return
+		# savepoint: route_event's partial writes must not leak into the
+		# committed state when the retry fails (same pattern as handle_event)
+		frappe.db.savepoint("razorpay_webhook_retry")
+		try:
+			# elevated: webhook handlers settle references and book receipts —
+			# a desk retry must not fail on the retrying user's permissions
+			with elevated_user():
+				result = reconciliation.route_event(event, self) or {}
+			mark_processed(
+				log_name,
+				status=result.get("status_label", "Processed"),
+				reference_doctype=result.get("reference_doctype") or log.reference_doctype,
+				reference_docname=result.get("reference_name") or log.reference_docname,
+			)
+		except Exception:
+			frappe.db.rollback(save_point="razorpay_webhook_retry")
+			mark_failed(
+				log_name,
+				reconciliation.preserve_sweep_attempt(log.error, frappe.get_traceback()),
+			)
+
+	def reconcile_transaction(self, transaction_name: str):
+		"""Re-confirm an open Payment Transaction against Razorpay.
+
+		Called by payment_core when the buyer lands on the shared success page:
+		the checkout callback can lose the race with the browser redirect.
+		Idempotent — settlement runs through the same paths as the callback
+		and webhook. Ledger-only: gateway-only sites settle through their own
+		flow.
+		"""
+		if not frappe.db.table_exists("Payment Transaction"):
+			return None
+		row = frappe.db.get_value(
+			"Payment Transaction",
+			transaction_name,
+			["provider_transaction_id", "reference_doctype", "reference_docname", "amount", "currency"],
+			as_dict=True,
+		)
+		provider_id = (row.provider_transaction_id if row else "") or ""
+		# an open transaction carries the order id; a captured one the payment
+		# id. Both resolve to a payment status check below.
+		if not provider_id:
+			return None
+
+		api_key, api_secret = get_razorpay_auth(self)
+		try:
+			if provider_id.startswith("pay_"):
+				resp = make_get_request(
+					f"{RAZORPAY_API_BASE}/payments/{provider_id}", auth=(api_key, api_secret)
+				)
+			else:
+				resp = make_get_request(
+					f"{RAZORPAY_API_BASE}/orders/{provider_id}/payments", auth=(api_key, api_secret)
+				)
+				# the order's payments, newest first: settle on the first
+				# captured/authorized one
+				resp = next(
+					(
+						p
+						for p in (resp.get("items") or resp or [])
+						if p.get("status") in ("captured", "authorized")
+					),
+					None,
+				)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "Razorpay reconcile lookup failed")
+			return None
+		if not resp:
+			return None
+
+		# the fetched payment must belong to this transaction's checkout: a
+		# captured payment for a different amount never settles it
+		charged = from_minor_units(resp.get("amount"), resp.get("currency"))
+		precision = get_amount_precision()
+		if charged is not None and flt(charged, precision) != flt(row.amount, precision):
+			frappe.logger("payment_core").warning(
+				"razorpay reconcile: payment %s amount %s != transaction %s amount %s",
+				resp.get("id"),
+				charged,
+				transaction_name,
+				row.amount,
+			)
+			return None
+
+		status = "Paid" if resp.get("status") == "captured" else "Initiated"
+		ledger.sync_payment_transaction(
+			{"payment_transaction": transaction_name},
+			status,
+			provider_transaction_id=resp.get("id"),
+			metadata={"razorpay_payment_id": resp.get("id")},
+		)
+		return {"status": status}
+
+	def refund_transaction(
+		self, transaction_name: str, amount: float, reason: str = "", idempotency_key: str | None = None
+	):
+		"""Refund a transaction's Razorpay payment; returns the refund id.
+
+		Ledger-only: gateway-only sites refund through their own flow.
+		Razorpay treats ``receipt`` as an idempotency key and also supports the
+		``X-Refund-Idempotency`` header. A duplicate receipt resolves to the
+		existing provider refund instead of paying twice.
+		"""
+		if not frappe.db.table_exists("Payment Transaction"):
+			frappe.throw(_("Ledger refunds need the shared Payment Transaction"))
+		row = frappe.db.get_value(
+			"Payment Transaction", transaction_name, ["provider_transaction_id", "currency"], as_dict=True
+		)
+		payment_id = row.provider_transaction_id if row else None
+		if not (payment_id or "").startswith("pay_"):
+			frappe.throw(_("Transaction {0} has no Razorpay payment to refund").format(transaction_name))
+
+		client = get_razorpay_client(self)
+		payload = {"amount": to_minor_units(flt(amount), row.currency if row else None)}
+		headers = None
+		receipt = _refund_receipt(idempotency_key)
+		if receipt:
+			payload["receipt"] = receipt
+			headers = {"X-Refund-Idempotency": _refund_header_key(idempotency_key)}
+		try:
+			refund = (
+				client.payment.refund(payment_id, payload, headers=headers)
+				if headers
+				else client.payment.refund(payment_id, payload)
+			)
+		except BadRequestError as exc:
+			# Razorpay's SDK exposes duplicate receipts only through this error
+			# text. If that text changes, re-raising is the safe failure mode.
+			if not receipt or "Duplicate receipt found" not in str(exc):
+				raise
+			refund = _find_refund_by_receipt(client, payment_id, receipt)
+			if not refund:
+				raise
+		return refund.get("id")
 
 	def on_trash(self):
 		clear_webhook_secret_cache()
@@ -669,6 +1018,46 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 
 		return verify_payment_signature(order_id, payment_id, signature, settings.api_secret)
 
+	def _claim_settlement(self, params, status=None):
+		"""Atomically claim this Integration Request before settlement.
+
+		``IntegrationRequest.update_status`` commits, so the row lock alone does
+		not cover the provider lookup and settlement that follow it. Persisting
+		A timestamp in ``settlement_started`` in that same write makes the claim
+		survive the commit; another request sees an unexpired lease and returns
+		without settling again. A crashed worker's lease expires for a later retry.
+		"""
+		IntegrationRequest = frappe.qb.DocType("Integration Request")
+		locked = (
+			frappe.qb.from_(IntegrationRequest)
+			.select(IntegrationRequest.status, IntegrationRequest.data)
+			.where(IntegrationRequest.name == self.integration_request.name)
+			.for_update()
+			.run(as_dict=True)
+		)
+		if not locked:
+			frappe.throw(_("Invalid payment token."), frappe.ValidationError)
+
+		row = locked[0]
+		stored = frappe.parse_json(row.data) or {}
+		if row.status in ("Completed", "Authorized") or _settlement_claim_is_active(
+			stored.get("settlement_started")
+		):
+			return False
+
+		claimed = merge_checkout_params(stored, params)
+		claimed.pop("token", None)
+		claimed["settlement_started"] = now_datetime().isoformat()
+
+		# update_status reads from the loaded document before applying params.
+		# Seed it with the locked row so this commit contains the claim and the
+		# latest server-stored checkout data in one write.
+		self.integration_request.data = frappe.as_json(stored)
+		self.integration_request.update_status(claimed, status or row.status)
+		self._settlement_claimed = True
+		self.data = frappe._dict(frappe.parse_json(self.integration_request.data))
+		return True
+
 	def _release_settlement_claim(self):
 		"""Clear the settlement_started key so a real retry can run."""
 		if not getattr(self, "_settlement_claimed", False):
@@ -679,6 +1068,7 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		if stored and stored.get("settlement_started"):
 			stored.pop("settlement_started", None)
 			self.integration_request.db_set("data", frappe.as_json(stored), update_modified=False)
+		self._settlement_claimed = False
 
 	def get_settings(self, data):
 		settings = frappe._dict(
@@ -725,7 +1115,7 @@ def capture_payment(is_sandbox=False, sanbox_response=None):
 
 	Note: Attempting to capture a payment whose status is not authorized will produce an error.
 	"""
-	# Load the controller once for the whole batch (it carries no per-row state).
+	# Load the controller once for the whole batch; per-row state is reset below.
 	controller = frappe.get_doc("Razorpay Settings")
 
 	# Never let a scheduled task raise: a failure here would crash the scheduler
@@ -753,11 +1143,12 @@ def capture_payment(is_sandbox=False, sanbox_response=None):
 		# Isolate each row in a savepoint so a failing capture rolls back only
 		# its own partial writes; the scheduler commits the whole batch at end.
 		frappe.db.savepoint("razorpay_capture_row")
+		provider_captured = False
 		try:
+			data = json.loads(row.data)
 			if is_sandbox:
 				resp = sanbox_response
 			else:
-				data = json.loads(row.data)
 				# Subscription auth payments are captured automatically by Razorpay
 				# via the mandate; manual capture here conflicts with that and 400s.
 				if data.get("subscription_id"):
@@ -780,25 +1171,44 @@ def capture_payment(is_sandbox=False, sanbox_response=None):
 					)
 
 			if resp.get("status") == "captured":
+				provider_captured = True
+				payment_id = resp.get("id") or data.get("razorpay_payment_id")
+				data["razorpay_payment_id"] = payment_id
+				controller.integration_request = frappe.get_doc("Integration Request", row.name)
+				controller.data = frappe._dict(data)
+				controller.flags.status_changed_to = "Completed"
+				frappe.flags.data = data
+				controller.authorize_reference()
+				ledger.sync_payment_transaction(
+					controller.data,
+					"Paid",
+					provider_transaction_id=payment_id,
+					metadata={"razorpay_payment_id": payment_id},
+				)
 				captured.append(row.name)
-			else:
-				frappe.db.release_savepoint("razorpay_capture_row")
+			frappe.db.release_savepoint("razorpay_capture_row")
 		except Exception:
 			frappe.db.rollback(save_point="razorpay_capture_row")
 			frappe.log_error(frappe.get_traceback(), f"Razorpay capture failed for {row.name}")
-			failed.append(row.name)
+			# A provider capture cannot be undone. Keep its Integration Request
+			# Authorized so the next hourly run retries only local settlement.
+			if not provider_captured:
+				failed.append(row.name)
 
 	# Bulk flush: two UPDATEs total instead of one set_value per row.
+	IntegrationRequest = frappe.qb.DocType("Integration Request")
 	if captured:
-		frappe.db.sql(
-			"UPDATE `tabIntegration Request` SET status = 'Completed' WHERE name IN %(names)s",
-			{"names": tuple(captured)},
-		)
+		(
+			frappe.qb.update(IntegrationRequest)
+			.set(IntegrationRequest.status, "Completed")
+			.where(IntegrationRequest.name.isin(captured))
+		).run()
 	if failed:
-		frappe.db.sql(
-			"UPDATE `tabIntegration Request` SET status = 'Failed' WHERE name IN %(names)s",
-			{"names": tuple(failed)},
-		)
+		(
+			frappe.qb.update(IntegrationRequest)
+			.set(IntegrationRequest.status, "Failed")
+			.where(IntegrationRequest.name.isin(failed))
+		).run()
 
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
@@ -841,6 +1251,9 @@ def order_payment_success(integration_request: str, params: str):
 		frappe.has_permission("Integration Request", "read", integration_request, throw=True)
 	params = json.loads(params)
 	integration = frappe.get_doc("Integration Request", integration_request)
+	controller = frappe.get_doc("Razorpay Settings")
+	controller.integration_request = integration
+	controller._settlement_claimed = False
 
 	# Fail closed: only Razorpay Integration Requests with a provider binding
 	if integration.integration_request_service != "Razorpay":
@@ -849,34 +1262,14 @@ def order_payment_success(integration_request: str, params: str):
 	if not (stored.get("order_id") or stored.get("subscription_id")):
 		frappe.throw(_("Invalid payment token."), frappe.ValidationError)
 
-	# A settled token is a no-op: replays must not run settlement again.
-	# Lock the row so concurrent requests cannot both pass the check.
-	IntegrationRequest = frappe.qb.DocType("Integration Request")
-	locked_status = (
-		frappe.qb.from_(IntegrationRequest)
-		.select(IntegrationRequest.status)
-		.where(IntegrationRequest.name == integration.name)
-		.for_update()
-		.run()
-	)
-	if locked_status and locked_status[0][0] in ("Completed", "Authorized"):
+	if not controller._claim_settlement(params):
 		return
 
-	# Update integration request — client params may carry the checkout result
-	# keys, never the checkout binding (what is paid, how much, against which
-	# reference): those stay as the Integration Request stored them.
-	integration.update_status(merge_checkout_params(stored, params), integration.status)
-	integration.reload()
-
-	data = json.loads(integration.data)
-	controller = frappe.get_doc("Razorpay Settings")
-
-	# Update payment and integration data for payment controller object
-	controller.integration_request = integration
-	controller.data = frappe._dict(data)
-
-	# Authorize payment
-	controller.authorize_payment()
+	try:
+		controller.authorize_payment()
+	except Exception:
+		controller._release_settlement_claim()
+		raise
 
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method

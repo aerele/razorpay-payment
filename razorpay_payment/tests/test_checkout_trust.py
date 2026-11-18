@@ -14,6 +14,8 @@ from unittest.mock import MagicMock, patch
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
+from razorpay_payment.gateway import ledger, reconciliation
+from razorpay_payment.gateway.references import merge_checkout_params
 from razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings import (
 	RazorpaySettings,
 	order_payment_success,
@@ -147,7 +149,41 @@ class TestCheckoutBinding(FrappeTestCase):
 			)
 
 		self.assertEqual(frappe.db.get_value("Integration Request", ir, "status"), "Failed")
+		self.assertNotIn("settlement_started", _ir_data(ir))
 		settle.assert_not_called()
+
+	def test_inflight_claim_blocks_a_second_success_callback(self):
+		"""The first callback commits its claim before settlement starts, so a
+		second callback that arrives after the lock is released is a no-op."""
+		stored_ref = _make_reference("in-flight claim")
+		ir = _make_integration_request("ToDo", stored_ref)
+		params = json.dumps({"razorpay_payment_id": "pay_T1", "razorpay_signature": "sig"})
+
+		def replay_while_claimed(_controller):
+			self.assertTrue(_ir_data(ir)["settlement_started"])
+			order_payment_success(ir, params)
+
+		with patch.object(
+			RazorpaySettings, "authorize_payment", autospec=True, side_effect=replay_while_claimed
+		) as authorize:
+			order_payment_success(ir, params)
+
+		authorize.assert_called_once()
+
+	def test_expired_settlement_claim_can_be_reacquired(self):
+		stored_ref = _make_reference("expired claim")
+		ir = _make_integration_request("ToDo", stored_ref)
+		data = _ir_data(ir)
+		data["settlement_started"] = "2000-01-01T00:00:00"
+		frappe.db.set_value("Integration Request", ir, "data", json.dumps(data), update_modified=False)
+
+		with patch.object(RazorpaySettings, "authorize_payment", return_value={}) as authorize:
+			order_payment_success(
+				ir, json.dumps({"razorpay_payment_id": "pay_T1", "razorpay_signature": "sig"})
+			)
+
+		authorize.assert_called_once()
+		self.assertNotEqual(_ir_data(ir)["settlement_started"], "2000-01-01T00:00:00")
 
 	def test_subscription_token_with_both_keys_matches(self):
 		"""A subscription token carries both order_id (the PR name, not a
@@ -302,6 +338,28 @@ class TestCheckoutBinding(FrappeTestCase):
 
 		self.assertNotIn("receipt", sent)
 
+	def test_checkout_drops_payment_transaction_without_ledger(self):
+		settings = RazorpaySettings({"doctype": "Razorpay Settings"})
+		with (
+			patch(f"{MODULE}.frappe.db.table_exists", return_value=False),
+			patch.object(ledger, "ensure_payment_transaction") as ensure,
+			patch.object(ledger, "sync_payment_transaction") as sync,
+			patch.object(
+				RazorpaySettings,
+				"create_order",
+				return_value={"id": "order_SERVER", "integration_request": "IR-SERVER"},
+			) as create_order,
+		):
+			settings.get_payment_url(
+				amount=100,
+				currency="INR",
+				payment_transaction="PAY-TRANSACTION-UNAVAILABLE",
+			)
+
+		self.assertNotIn("payment_transaction", ensure.call_args.args[1])
+		self.assertNotIn("payment_transaction", create_order.call_args.kwargs)
+		self.assertNotIn("payment_transaction", sync.call_args.args[0])
+
 	def test_order_notes_win_over_payment_notes(self):
 		"""The order's notes (server-minted) are used for settlement, not the
 		payment entity's notes (browser-set)."""
@@ -332,8 +390,6 @@ class TestCheckoutBinding(FrappeTestCase):
 			"currency": "INR",
 			"notes": {"reference_doctype": "ToDo", "reference_docname": stored_ref},
 		}
-
-		from razorpay_payment.gateway import reconciliation
 
 		settings = MagicMock(name="RS")
 		with (
@@ -372,8 +428,6 @@ class TestCheckoutBinding(FrappeTestCase):
 		}
 		order_resp = {"id": "order_STORED", "amount": 10000, "currency": "INR"}
 
-		from razorpay_payment.gateway import reconciliation
-
 		settings = MagicMock(name="RS")
 		with (
 			patch("razorpay_payment.gateway.reconciliation.make_get_request", return_value=order_resp),
@@ -386,8 +440,6 @@ class TestCheckoutBinding(FrappeTestCase):
 		"""merge_checkout_params drops a trusted key even when the stored
 		       data has no value for it — a token minted before the field existed
 		must not let the request supply it."""
-		from razorpay_payment.gateway.references import merge_checkout_params
-
 		stored = {"order_id": "order_A"}  # no payment_transaction
 		params = {"payment_transaction": "PAY-FAKE", "order_id": "order_B"}
 		merged = merge_checkout_params(stored, params)

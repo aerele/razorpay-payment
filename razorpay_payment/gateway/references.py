@@ -66,6 +66,7 @@ def get_razorpay_notes(data=None, integration_request=None):
 		"reference_doctype": data.get("reference_doctype"),
 		"reference_docname": data.get("reference_docname"),
 		"integration_request": integration_request,
+		"payment_transaction": data.get("payment_transaction"),
 	}
 	return {k: str(v) for k, v in notes.items() if v is not None}
 

@@ -1,16 +1,28 @@
 # Copyright (c) Frappe Technologies Pvt. Ltd. and contributors
-# License: MIT. See LICENSE
+# License: MIT
 #
-# Unit tests for Razorpay webhook verification, dispatch, and sweep (no live API calls).
+# Unit tests for Razorpay webhook verification, dispatch, and sweep (no live
+# API calls). Dedupe and the retryable Failed state live in payment_core's
+# shared Payment Webhook Log; the ERPNext settlement branch of
+# payment.captured runs only on ERPNext sites (table-gated below).
 
 import json
+from unittest import skipUnless
 from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from payment_core.webhooks import DUPLICATE
 
 from razorpay_payment.gateway.reconciliation import route_event, sweep_pending
 from razorpay_payment.gateway.webhooks import construct_event, handle_event
+from razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings import (
+	RazorpaySettings,
+	capture_payment,
+	order_payment_success,
+)
+
+ERPNext_INSTALLED = frappe.db.table_exists("Payment Entry")
 
 
 def _build_event(
@@ -55,6 +67,74 @@ def _mock_order(reference_doctype="Payment Request", reference_docname="PR-001",
 
 
 class TestRazorpayWebhooks(FrappeTestCase):
+	@skipUnless(ERPNext_INSTALLED, "scheduled Payment Request settlement needs ERPNext")
+	def test_authorized_callback_settles_payment_request_after_scheduled_capture(self):
+		payment_request = frappe.get_doc(
+			{
+				"doctype": "Payment Request",
+				"payment_request_type": "Inward",
+				"status": "Requested",
+				"grand_total": 100,
+				"currency": "INR",
+			}
+		)
+		payment_request.db_insert()
+		data = {
+			"reference_doctype": "Payment Request",
+			"reference_docname": payment_request.name,
+			"order_id": "order_CAPTURE",
+			"razorpay_payment_id": "pay_CAPTURE",
+			"amount": 10000,
+			"currency": "INR",
+		}
+		integration_request = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Razorpay",
+				"status": "Queued",
+				"data": json.dumps(data),
+			}
+		).insert(ignore_permissions=True)
+		frappe.flags.integration_request = frappe._dict(status_code=200)
+		provider_responses = [
+			{
+				"id": "pay_CAPTURE",
+				"status": "authorized",
+				"order_id": "order_CAPTURE",
+				"amount": 10000,
+				"currency": "INR",
+			},
+			{
+				"id": "pay_CAPTURE",
+				"status": "captured",
+				"order_id": "order_CAPTURE",
+				"amount": 10000,
+				"currency": "INR",
+			},
+		]
+
+		with (
+			patch.object(RazorpaySettings, "verify_checkout_signature", return_value=True),
+			patch(
+				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.make_get_request",
+				side_effect=provider_responses,
+			),
+			patch.object(RazorpaySettings, "settle_payment_request", return_value="PE-1") as settle,
+		):
+			order_payment_success(
+				integration_request.name,
+				json.dumps({"razorpay_payment_id": "pay_CAPTURE", "razorpay_signature": "sig"}),
+			)
+			settle.assert_not_called()
+			capture_payment()
+			capture_payment()
+
+		settle.assert_called_once()
+		self.assertEqual(settle.call_args.kwargs, {"payment_id": "pay_CAPTURE"})
+		self.assertEqual(
+			frappe.db.get_value("Integration Request", integration_request.name, "status"), "Completed"
+		)
+
 	def test_construct_event_rejects_bad_signature(self):
 		"""A bad/absent signature must return None before any handler runs."""
 		with (
@@ -76,11 +156,11 @@ class TestRazorpayWebhooks(FrappeTestCase):
 		settings.name = "Razorpay Settings"
 
 		with patch(
-			"razorpay_payment.gateway.webhooks.frappe.db.get_value",
-			return_value=frappe._dict(name="LOG-1", status="Processed"),
+			"razorpay_payment.gateway.webhooks.get_or_create_log",
+			return_value=(MagicMock(name="log"), True),
 		):
-			result = handle_event(json.dumps(_build_event()), "evt_001", settings)
-		self.assertEqual(result["status"], "duplicate")
+			result = handle_event(_build_event(), settings)
+		self.assertEqual(result, DUPLICATE)
 
 	def test_route_event_ignored_unknown(self):
 		"""Unknown event types return Ignored."""
@@ -89,8 +169,9 @@ class TestRazorpayWebhooks(FrappeTestCase):
 		result = route_event(event, settings)
 		self.assertEqual(result["status_label"], "Ignored")
 
+	@skipUnless(ERPNext_INSTALLED, "the Payment Entry settlement branch needs ERPNext")
 	def test_payment_captured_settles_payment_request(self):
-		"""payment.captured calls authorize_reference to settle the PR."""
+		"""Payment Requests always use payment_core's builder."""
 		settings = MagicMock(name="RS")
 		settings.settle_payment_request = MagicMock()
 
@@ -105,27 +186,13 @@ class TestRazorpayWebhooks(FrappeTestCase):
 		):
 			pr = MagicMock(name="PR")
 			pr.doctype = "Payment Request"
-			# MagicMock auto-creates attributes, so hasattr returns True. We must
-			# configure the spec to prevent auto-creation so `hasattr(ref, "on_payment_authorized")` is False.
-			pr.on_payment_authorized = None  # Setting to None makes hasattr return False if spec is set
 			get_doc.return_value = pr
-
-			# Patch the global hasattr used inside the handler to return False
-			import builtins
-
-			original_hasattr = builtins.hasattr
-
-			def mock_hasattr(obj, name):
-				if name == "on_payment_authorized":
-					return False
-				return original_hasattr(obj, name)
-
-			with patch("builtins.hasattr", side_effect=mock_hasattr):
-				result = route_event(event, settings)
+			result = route_event(event, settings)
 
 		settings.settle_payment_request.assert_called_once_with(pr, payment_id="pay_001")
 		self.assertEqual(result["status_label"], "Processed")
 
+	@skipUnless(ERPNext_INSTALLED, "the Payment Entry settlement branch needs ERPNext")
 	def test_payment_captured_fails_if_pe_not_created(self):
 		"""If settlement doesn't produce a PE, the handler must throw (marking it Failed)."""
 		settings = MagicMock(name="RS")
@@ -142,24 +209,12 @@ class TestRazorpayWebhooks(FrappeTestCase):
 		):
 			pr = MagicMock(name="PR")
 			pr.doctype = "Payment Request"
-			pr.on_payment_authorized = None
-
 			get_doc.return_value = pr
-
-			import builtins
-
-			original_hasattr = builtins.hasattr
-
-			def mock_hasattr(obj, name):
-				if name == "on_payment_authorized":
-					return False
-				return original_hasattr(obj, name)
-
-			with patch("builtins.hasattr", side_effect=mock_hasattr):
-				with self.assertRaises(frappe.ValidationError) as ctx:
-					route_event(event, settings)
+			with self.assertRaises(frappe.ValidationError) as ctx:
+				route_event(event, settings)
 		self.assertIn("Settlement failed", str(ctx.exception))
 
+	@skipUnless(ERPNext_INSTALLED, "the Payment Entry settlement branch needs ERPNext")
 	def test_payment_captured_ignores_duplicate(self):
 		"""Second webhook for same payment_id → Ignored (ledger dedupe)."""
 		settings = MagicMock(name="RS")
@@ -176,7 +231,7 @@ class TestRazorpayWebhooks(FrappeTestCase):
 		self.assertEqual(result["status_label"], "Ignored")
 
 	def test_payment_failed_adds_comment(self):
-		"""payment.failed adds a comment to the PR."""
+		"""payment.failed adds a comment to the reference."""
 		settings = MagicMock(name="RS")
 		event = _build_event(event_type="payment.failed")
 		event["payload"]["payment"]["entity"]["error_description"] = "Insufficient funds"
@@ -184,6 +239,7 @@ class TestRazorpayWebhooks(FrappeTestCase):
 		with (
 			patch("razorpay_payment.gateway.reconciliation.make_get_request", return_value=_mock_order()),
 			patch("razorpay_payment.gateway.reconciliation.get_razorpay_auth", return_value=("k", "s")),
+			patch("razorpay_payment.gateway.reconciliation.frappe.db.exists", return_value=True),
 			patch("razorpay_payment.gateway.reconciliation.frappe.get_doc") as get_doc,
 		):
 			pr = MagicMock(name="PR")
@@ -197,12 +253,14 @@ class TestRazorpayWebhooks(FrappeTestCase):
 		self.assertIn("Insufficient funds", args[1])
 
 	def test_sweep_retries_failed_events(self):
-		"""sweep_pending retries Failed events and increments retry_count."""
-		failed_row = MagicMock()
-		failed_row.name = "LOG-1"
-		failed_row.razorpay_settings = "Razorpay Settings"
-		failed_row.payload = json.dumps(_build_event())
-		failed_row.retry_count = 0
+		"""sweep_pending retries Failed Payment Webhook Log rows via mark_failed."""
+		# a real _dict: the sweep reads row.get("error") and parses it
+		failed_row = frappe._dict(
+			name="PWL-1",
+			payload=json.dumps(_build_event()),
+			event_type="payment.captured",
+			error=None,
+		)
 
 		settings = MagicMock(name="RS")
 
@@ -213,10 +271,9 @@ class TestRazorpayWebhooks(FrappeTestCase):
 			patch("razorpay_payment.gateway.reconciliation.frappe.db.savepoint"),
 			patch("razorpay_payment.gateway.reconciliation.frappe.db.rollback"),
 			patch("razorpay_payment.gateway.reconciliation.frappe.log_error"),
-			patch("razorpay_payment.gateway.reconciliation._apply_sweep_status") as apply_status,
+			patch("razorpay_payment.gateway.reconciliation.mark_failed") as mark,
 		):
 			sweep_pending()
 
-		apply_status.assert_called_once()
-		failed, _processed = apply_status.call_args[0]
-		self.assertIn("LOG-1", failed)
+		mark.assert_called_once()
+		self.assertIn("sweep attempt 1", mark.call_args[0][1])
