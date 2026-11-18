@@ -220,11 +220,13 @@ class TestRazorpaySubscriptions(FrappeTestCase):
 
 	def test_sweep_retries_failed_subscription_event(self):
 		"""sweep_pending retries a Failed subscription.charged event."""
-		failed_row = MagicMock()
-		failed_row.name = "LOG-SUB-1"
-		failed_row.razorpay_settings = "Razorpay Settings"
-		failed_row.payload = json.dumps(_build_subscription_event())
-		failed_row.retry_count = 0
+		# a real _dict: the sweep reads row.get("error") and parses it
+		failed_row = frappe._dict(
+			name="PWL-SUB-1",
+			payload=json.dumps(_build_subscription_event()),
+			event_type="subscription.charged",
+			error=None,
+		)
 
 		settings = MagicMock(name="RS")
 
@@ -241,10 +243,9 @@ class TestRazorpaySubscriptions(FrappeTestCase):
 			patch("razorpay_payment.gateway.reconciliation.frappe.db.savepoint"),
 			patch("razorpay_payment.gateway.reconciliation.frappe.db.rollback"),
 			patch("razorpay_payment.gateway.reconciliation.frappe.log_error"),
-			patch("razorpay_payment.gateway.reconciliation._apply_sweep_status") as apply_status,
+			patch("razorpay_payment.gateway.reconciliation.mark_failed") as mark,
 		):
 			sweep_pending()
 
-		apply_status.assert_called_once()
-		failed, _ = apply_status.call_args[0]
-		self.assertIn("LOG-SUB-1", failed)
+		mark.assert_called_once()
+		self.assertIn("sweep attempt 1", mark.call_args[0][1])
