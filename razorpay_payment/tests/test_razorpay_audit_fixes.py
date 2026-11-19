@@ -133,6 +133,10 @@ class TestGuestEndpointGuards(FrappeTestCase):
 		hp.assert_not_called()
 
 	def test_order_payment_success_enforces_auth_read(self):
+		fake_ir = MagicMock(name="IR")
+		fake_ir.integration_request_service = "Razorpay"
+		fake_ir.status = "Queued"
+		fake_ir.data = json.dumps({"order_id": "order_T", "amount": 100})
 		with (
 			patch(
 				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.session",
@@ -141,13 +145,20 @@ class TestGuestEndpointGuards(FrappeTestCase):
 			patch(
 				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.has_permission"
 			) as hp,
-			patch("razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.get_doc"),
+			patch(
+				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.frappe.get_doc",
+				return_value=fake_ir,
+			),
 			patch(
 				"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.json.loads",
 				return_value={},
 			),
+			patch("razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.RazorpaySettings"),
 		):
-			order_payment_success("IR-1", "{}")
+			# the mocked flow throws downstream (no binding on the mock IR);
+			# the permission guard is what this test pins
+			with self.assertRaises(Exception):
+				order_payment_success("IR-1", "{}")
 		hp.assert_called_once_with("Integration Request", "read", "IR-1", throw=True)
 
 	def test_order_payment_failure_enforces_auth_read(self):
@@ -382,9 +393,14 @@ class TestMakePaymentCheckout(FrappeTestCase):
 		# Use a fake session object so the Guest check passes (auth user).
 		fake_session = MagicMock()
 		fake_session.user = "user@example.com"
+		stored = json.dumps({"reference_doctype": "Payment Request", "reference_docname": "PR-1"})
 		with (
 			patch.object(page, "guard_payment_reference") as gpr,
 			patch.object(page, "assert_reference_payable"),
+			patch(
+				"razorpay_payment.templates.pages.razorpay_checkout.frappe.db.get_value",
+				return_value=stored,
+			),
 			patch("razorpay_payment.templates.pages.razorpay_checkout.frappe.session", fake_session),
 			patch("razorpay_payment.templates.pages.razorpay_checkout.frappe.has_permission"),
 			patch("razorpay_payment.templates.pages.razorpay_checkout.frappe.get_doc"),
@@ -393,9 +409,10 @@ class TestMakePaymentCheckout(FrappeTestCase):
 				razorpay_payment_id="pay_1",
 				options="{}",
 				reference_doctype="Payment Request",
-				reference_docname="PR-1",
+				reference_docname="PR-ATTACK",
 				token="IR-1",
 			)
+		# the guarded reference is the stored one, not the request's
 		gpr.assert_called_once_with("Payment Request", "PR-1")
 
 	def test_make_payment_has_no_manual_commit(self):

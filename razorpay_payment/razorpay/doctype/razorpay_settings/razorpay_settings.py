@@ -88,6 +88,7 @@ from razorpay_payment.gateway.references import (
 	assert_reference_payable,
 	get_razorpay_notes,
 	is_subscription_reference,
+	merge_checkout_params,
 	success_redirect,
 )
 from razorpay_payment.gateway.subscriptions import create_razorpay_subscription
@@ -408,20 +409,16 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			# create_razorpay_subscription needs a plain dict, not kwargs.
 			return create_razorpay_subscription(self.name, kwargs)
 
-		# create a razorpay order unless a valid razorpay order id is already provided
-		if not str(kwargs.get("order_id") or "").startswith("order_"):
-			kwargs.setdefault("receipt", kwargs.get("order_id"))
-			order = self.create_order(**kwargs)
-			kwargs.update({"order_id": order.get("id")})
-			# create_order already logged the Integration Request; only its name is
-			# needed here to build the checkout URL — read the scalar directly.
-			integration_request_name = order["integration_request"]
-		else:
-			# Token data always carries minor units (same as the create_order path)
-			# so the checkout page and capture flow read one consistent unit.
-
-			kwargs["amount"] = to_minor_units(kwargs["amount"], kwargs.get("currency") or "INR")
-			integration_request_name = create_request_log(kwargs, service_name="Razorpay").name
+		# Always create a fresh server-side order: a caller-supplied order_id
+		# would let the client name which order the buyer pays for. The caller's
+		# value is kept as the order receipt (the merchant sees the document
+		# name in the Razorpay dashboard), never as the order id itself.
+		kwargs.setdefault("receipt", kwargs.pop("order_id", None))
+		order = self.create_order(**kwargs)
+		kwargs.update({"order_id": order.get("id")})
+		# create_order already logged the Integration Request; only its name is
+		# needed here to build the checkout URL — read the scalar directly.
+		integration_request_name = order["integration_request"]
 		return get_url(f"./razorpay_checkout?token={integration_request_name}")
 
 	def create_order(self, **kwargs):
@@ -442,6 +439,8 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			"payment_capture": kwargs.get("payment_capture") or 1,
 			"notes": get_razorpay_notes(kwargs, integration_request=integration_request.name),
 		}
+		# Razorpay rejects null payment_capture; be safe with other None values
+		payment_options = {k: v for k, v in payment_options.items() if v is not None}
 		if self.api_key and self.api_secret:
 			try:
 				# Order retries dedupe via ``receipt``; there is no HTTP idempotency header for Orders.
@@ -465,12 +464,28 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 
 		try:
 			self.integration_request = frappe.get_doc("Integration Request", self.data.token)
-			# Never let client params overwrite server-stored order binding fields
-			# (signature verification pins the payment to this stored order_id).
-			protected = {"order_id", "subscription_id", "amount", "currency"}
+
+			# Fail closed: only Razorpay Integration Requests with a provider binding
+			if self.integration_request.integration_request_service != "Razorpay":
+				frappe.throw(_("Invalid payment token."), frappe.ValidationError)
 			stored = json.loads(self.integration_request.data)
-			params = {k: v for k, v in self.data.items() if k not in protected or stored.get(k) in (None, "")}
+			if not (stored.get("order_id") or stored.get("subscription_id")):
+				frappe.throw(_("Invalid payment token."), frappe.ValidationError)
+
+			# A completed token is settled: check BEFORE update_status resets
+			# the status to "Queued" (replays must not run settlement again)
+			if self.integration_request.status == "Completed":
+				return {"redirect_to": "payment-success", "status": 200}
+
+			# Never let client params overwrite server-stored checkout binding
+			# fields (what is being paid, for how much, against which reference).
+			params = merge_checkout_params(stored, self.data)
+			params.pop("token", None)
 			self.integration_request.update_status(params, "Queued")
+
+			# Settlement reads the stored data — never the browser's copy
+			self.data = frappe._dict(json.loads(self.integration_request.data))
+
 			return self.authorize_payment()
 
 		except Exception:
@@ -494,6 +509,11 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		data = json.loads(self.integration_request.data)
 		settings = self.get_settings(data)
 
+		# a completed token is settled: replays (page refreshes, a second
+		# callback with the same token) must not run settlement again
+		if self.integration_request.status == "Completed":
+			return {"redirect_to": "payment-success", "status": 200}
+
 		if not self.verify_checkout_signature(data, settings):
 			self.integration_request.db_set("status", "Failed", update_modified=False)
 			self.integration_request.db_set(
@@ -505,11 +525,23 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			)
 			return {"redirect_to": "payment-failed", "status": 401}
 
+		resp = {}
 		try:
 			resp = make_get_request(
 				f"https://api.razorpay.com/v1/payments/{self.data.razorpay_payment_id}",
 				auth=(settings.api_key, settings.api_secret),
 			)
+
+			if not self.payment_matches_stored_checkout(data, resp):
+				self.integration_request.db_set("status", "Failed", update_modified=False)
+				self.integration_request.db_set(
+					"error", _("Razorpay payment does not match the stored checkout."), update_modified=False
+				)
+				frappe.log_error(
+					title="Razorpay payment mismatch",
+					message=f"Integration Request: {self.integration_request.name}",
+				)
+				return {"redirect_to": "payment-failed", "status": 401}
 
 			if resp.get("status") == "authorized":
 				self.integration_request.update_status(data, "Authorized")
@@ -563,6 +595,28 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			redirect_url += "&" + urlencode({"redirect_message": redirect_message})
 
 		return {"redirect_to": redirect_url, "status": status}
+
+	def payment_matches_stored_checkout(self, data, resp):
+		"""The provider's payment must belong to this token's stored checkout.
+
+		The order binding and amount come from the Integration Request (both in
+		minor units); the payment entity comes straight from the Razorpay API.
+		A payment for any other order, or for a different amount, must never
+		settle this checkout. One-off orders check both; subscription checkouts
+		auth against the subscription id instead of an order.
+		"""
+		if data.get("subscription_id"):
+			if resp.get("subscription_id") and resp.get("subscription_id") != data.get("subscription_id"):
+				return False
+			return True
+		if str(data.get("order_id") or "").startswith("order_"):
+			if resp.get("order_id") != data.get("order_id"):
+				return False
+			if resp.get("amount") is not None and cint(resp.get("amount")) != cint(data.get("amount")):
+				return False
+			return True
+		# no provider binding on this token: fail closed
+		return False
 
 	def authorize_reference(self):
 		"""Settle the paid reference document via the partial-aware settler."""
@@ -768,8 +822,21 @@ def order_payment_success(integration_request: str, params: str):
 	params = json.loads(params)
 	integration = frappe.get_doc("Integration Request", integration_request)
 
-	# Update integration request
-	integration.update_status(params, integration.status)
+	# Fail closed: only Razorpay Integration Requests with a provider binding
+	if integration.integration_request_service != "Razorpay":
+		frappe.throw(_("Invalid payment token."), frappe.ValidationError)
+	stored = json.loads(integration.data)
+	if not (stored.get("order_id") or stored.get("subscription_id")):
+		frappe.throw(_("Invalid payment token."), frappe.ValidationError)
+
+	# A completed token is settled: replays must not run settlement again
+	if integration.status == "Completed":
+		return
+
+	# Update integration request — client params may carry the checkout result
+	# keys, never the checkout binding (what is paid, how much, against which
+	# reference): those stay as the Integration Request stored them.
+	integration.update_status(merge_checkout_params(stored, params), integration.status)
 	integration.reload()
 
 	data = json.loads(integration.data)
