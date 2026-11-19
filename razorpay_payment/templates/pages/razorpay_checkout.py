@@ -78,6 +78,16 @@ def make_payment(
 	razorpay_order_id: str | None = None,
 	razorpay_signature: str | None = None,
 ):
+	# The checkout binding (what is paid, against which reference) is the
+	# Integration Request's stored data — minted by get_payment_url when the
+	# token was issued. Request-supplied reference names are never trusted:
+	# they name what the SERVER must settle, so only the stored values are.
+	stored = json.loads(frappe.db.get_value("Integration Request", token, "data") or "{}")
+	reference_doctype = stored.get("reference_doctype")
+	reference_docname = stored.get("reference_docname")
+	if not (reference_doctype and reference_docname):
+		frappe.throw(_("Invalid payment token."), frappe.ValidationError)
+
 	# Reject payment endpoints pointed at an arbitrary or non-existent reference.
 	# Authenticated callers must also own it; the guest checkout flow is allowed
 	# because the Integration Request token (minted by get_payment_url) is the auth.

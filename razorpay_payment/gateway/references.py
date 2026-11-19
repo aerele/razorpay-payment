@@ -1,9 +1,11 @@
 # Copyright (c) Frappe Technologies Pvt. Ltd. and contributors
-# License: MIT. See LICENSE
+# License: MIT
 #
 # Razorpay-specific reference helpers. The gateway-agnostic ones (subscription
 # flag, success redirect, Payment Request settlement) live in payment_core and
 # are re-exported here for callers inside this app.
+
+import json
 
 import frappe
 from frappe import _
@@ -15,13 +17,46 @@ from payment_core.utils import (
 )
 
 __all__ = [
+	"CHECKOUT_TRUSTED_FIELDS",
 	"assert_reference_payable",
 	"authorize_reference",
 	"get_razorpay_notes",
 	"is_subscription_reference",
+	"merge_checkout_params",
 	"settle_payment_request",
 	"success_redirect",
 ]
+
+# The checkout binding: what the buyer is paying, and how much. These values
+# are minted by get_payment_url into the Integration Request and are the only
+# source of truth for settlement — request params with these keys are never
+# merged over them.
+CHECKOUT_TRUSTED_FIELDS = (
+	"order_id",
+	"subscription_id",
+	"amount",
+	"currency",
+	"reference_doctype",
+	"reference_docname",
+	"payment_transaction",
+)
+
+
+def merge_checkout_params(stored_data, params):
+	"""Merge client params over the stored checkout data, trusted fields aside.
+
+	``stored_data`` is the Integration Request's data (the server-minted
+	 binding); ``params`` come from the browser. Client values for
+	 :data:`CHECKOUT_TRUSTED_FIELDS` are dropped unless the stored row has no
+	 value for that key (a field the server never set cannot be spoofed).
+	"""
+	params = dict(params or {})
+	for key in CHECKOUT_TRUSTED_FIELDS:
+		if key in params and stored_data.get(key) not in (None, ""):
+			params.pop(key)
+	merged = dict(stored_data or {})
+	merged.update(params)
+	return merged
 
 
 def get_razorpay_notes(data=None, integration_request=None):
