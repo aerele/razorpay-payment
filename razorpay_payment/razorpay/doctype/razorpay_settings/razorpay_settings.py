@@ -472,9 +472,18 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			if not (stored.get("order_id") or stored.get("subscription_id")):
 				frappe.throw(_("Invalid payment token."), frappe.ValidationError)
 
-			# A completed token is settled: check BEFORE update_status resets
-			# the status to "Queued" (replays must not run settlement again)
-			if self.integration_request.status == "Completed":
+			# A settled token is a no-op: check BEFORE update_status resets
+			# the status to "Queued". Lock the row so two concurrent requests
+			# cannot both pass the check and both settle.
+			IntegrationRequest = frappe.qb.DocType("Integration Request")
+			locked_status = (
+				frappe.qb.from_(IntegrationRequest)
+				.select(IntegrationRequest.status)
+				.where(IntegrationRequest.name == self.integration_request.name)
+				.for_update()
+				.run()
+			)
+			if locked_status and locked_status[0][0] in ("Completed", "Authorized"):
 				return {"redirect_to": "payment-success", "status": 200}
 
 			# Never let client params overwrite server-stored checkout binding
@@ -660,6 +669,17 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 
 		return verify_payment_signature(order_id, payment_id, signature, settings.api_secret)
 
+	def _release_settlement_claim(self):
+		"""Clear the settlement_started key so a real retry can run."""
+		if not getattr(self, "_settlement_claimed", False):
+			return
+		stored = frappe.parse_json(
+			frappe.db.get_value("Integration Request", self.integration_request.name, "data")
+		)
+		if stored and stored.get("settlement_started"):
+			stored.pop("settlement_started", None)
+			self.integration_request.db_set("data", frappe.as_json(stored), update_modified=False)
+
 	def get_settings(self, data):
 		settings = frappe._dict(
 			{
@@ -829,8 +849,17 @@ def order_payment_success(integration_request: str, params: str):
 	if not (stored.get("order_id") or stored.get("subscription_id")):
 		frappe.throw(_("Invalid payment token."), frappe.ValidationError)
 
-	# A completed token is settled: replays must not run settlement again
-	if integration.status == "Completed":
+	# A settled token is a no-op: replays must not run settlement again.
+	# Lock the row so concurrent requests cannot both pass the check.
+	IntegrationRequest = frappe.qb.DocType("Integration Request")
+	locked_status = (
+		frappe.qb.from_(IntegrationRequest)
+		.select(IntegrationRequest.status)
+		.where(IntegrationRequest.name == integration.name)
+		.for_update()
+		.run()
+	)
+	if locked_status and locked_status[0][0] in ("Completed", "Authorized"):
 		return
 
 	# Update integration request — client params may carry the checkout result

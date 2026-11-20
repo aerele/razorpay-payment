@@ -26,15 +26,34 @@ def route_event(event, settings):
 
 
 def reconcile_payment_captured(event, settings):  # dispatched via _HANDLERS
-	"""payment.captured — settle the Payment Request linked via order notes."""
+	"""payment.captured — settle the reference linked via the ORDER's notes.
+
+	The payment entity's notes are set by the browser and cannot be trusted.
+	The server minted the order's notes at checkout; the payment's order_id
+	resolves to that order, so the binding (reference, amount) is read from
+	the order via the Razorpay API, and the payment amount is verified
+	against the order amount before any settlement.
+	"""
 	payment_entity = event.get("payload", {}).get("payment", {}).get("entity", {})
 	payment_id = payment_entity.get("id")
-	notes = payment_entity.get("notes", {})
+	order_id = payment_entity.get("order_id")
 
 	# Subscription payments are owned by subscription.charged; payment.captured
-	# skips them to avoid a double PE on the auth transaction.
+	# skips them to avoid a double settlement on the auth transaction.
 	if payment_entity.get("subscription_id"):
 		return {"status_label": "Ignored"}
+
+	if not order_id:
+		return {"status_label": "Ignored"}
+
+	# Fetch the order: its notes are the server-minted binding, and its
+	# amount is the checkout's amount. Both are compared with the payment.
+	api_key, api_secret = get_razorpay_auth(settings)
+	order = make_get_request(f"{RAZORPAY_API_BASE}/orders/{order_id}", auth=(api_key, api_secret))
+	notes = order.get("notes") or {}
+
+	if cint(payment_entity.get("amount")) != cint(order.get("amount")):
+		frappe.throw(_("Payment amount does not match the order amount"))
 
 	reference_doctype = notes.get("reference_doctype")
 	reference_docname = notes.get("reference_docname")
@@ -65,9 +84,18 @@ def reconcile_payment_captured(event, settings):  # dispatched via _HANDLERS
 
 
 def mark_payment_failed(event, settings):  # dispatched via _HANDLERS
-	"""payment.failed — mark the Integration Request Failed and comment on the PR."""
+	"""payment.failed — comment on the reference linked via the ORDER's notes."""
 	payment_entity = event.get("payload", {}).get("payment", {}).get("entity", {})
-	notes = payment_entity.get("notes", {})
+	order_id = payment_entity.get("order_id")
+
+	notes = {}
+	if order_id:
+		try:
+			api_key, api_secret = get_razorpay_auth(settings)
+			order = make_get_request(f"{RAZORPAY_API_BASE}/orders/{order_id}", auth=(api_key, api_secret))
+			notes = order.get("notes") or {}
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "Razorpay order lookup failed")
 
 	reference_doctype = notes.get("reference_doctype")
 	reference_docname = notes.get("reference_docname")
