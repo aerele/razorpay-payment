@@ -30,6 +30,9 @@ def _build_event(
 				"entity": {
 					"id": payment_id,
 					"status": "captured",
+					"order_id": "order_001",
+					"amount": 10000,
+					"currency": "INR",
 					"notes": {
 						"reference_doctype": reference_doctype,
 						"reference_docname": reference_docname,
@@ -38,6 +41,16 @@ def _build_event(
 				}
 			}
 		},
+	}
+
+
+def _mock_order(reference_doctype="Payment Request", reference_docname="PR-001", amount=10000):
+	"""Order entity as returned by GET /orders/{id} — server-minted notes."""
+	return {
+		"id": "order_001",
+		"amount": amount,
+		"currency": "INR",
+		"notes": {"reference_doctype": reference_doctype, "reference_docname": reference_docname},
 	}
 
 
@@ -84,6 +97,8 @@ class TestRazorpayWebhooks(FrappeTestCase):
 		event = _build_event(event_type="payment.captured")
 
 		with (
+			patch("razorpay_payment.gateway.reconciliation.make_get_request", return_value=_mock_order()),
+			patch("razorpay_payment.gateway.reconciliation.get_razorpay_auth", return_value=("k", "s")),
 			# 1st call (duplicate guard): False. 2nd call (verify PE created): True.
 			patch("razorpay_payment.gateway.reconciliation.frappe.db.exists", side_effect=[False, True]),
 			patch("razorpay_payment.gateway.reconciliation.frappe.get_doc") as get_doc,
@@ -119,6 +134,8 @@ class TestRazorpayWebhooks(FrappeTestCase):
 		event = _build_event(event_type="payment.captured")
 
 		with (
+			patch("razorpay_payment.gateway.reconciliation.make_get_request", return_value=_mock_order()),
+			patch("razorpay_payment.gateway.reconciliation.get_razorpay_auth", return_value=("k", "s")),
 			# 1st call (duplicate guard): False. 2nd call (verify PE created): False.
 			patch("razorpay_payment.gateway.reconciliation.frappe.db.exists", side_effect=[False, False]),
 			patch("razorpay_payment.gateway.reconciliation.frappe.get_doc") as get_doc,
@@ -148,7 +165,11 @@ class TestRazorpayWebhooks(FrappeTestCase):
 		settings = MagicMock(name="RS")
 		event = _build_event(event_type="payment.captured")
 
-		with patch("razorpay_payment.gateway.reconciliation.frappe.db.exists", return_value=True):
+		with (
+			patch("razorpay_payment.gateway.reconciliation.make_get_request", return_value=_mock_order()),
+			patch("razorpay_payment.gateway.reconciliation.get_razorpay_auth", return_value=("k", "s")),
+			patch("razorpay_payment.gateway.reconciliation.frappe.db.exists", return_value=True),
+		):
 			result = route_event(event, settings)
 
 		settings.settle_payment_request.assert_not_called()
@@ -160,7 +181,11 @@ class TestRazorpayWebhooks(FrappeTestCase):
 		event = _build_event(event_type="payment.failed")
 		event["payload"]["payment"]["entity"]["error_description"] = "Insufficient funds"
 
-		with patch("razorpay_payment.gateway.reconciliation.frappe.get_doc") as get_doc:
+		with (
+			patch("razorpay_payment.gateway.reconciliation.make_get_request", return_value=_mock_order()),
+			patch("razorpay_payment.gateway.reconciliation.get_razorpay_auth", return_value=("k", "s")),
+			patch("razorpay_payment.gateway.reconciliation.frappe.get_doc") as get_doc,
+		):
 			pr = MagicMock(name="PR")
 			get_doc.return_value = pr
 
