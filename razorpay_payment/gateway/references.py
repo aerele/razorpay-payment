@@ -47,13 +47,13 @@ def merge_checkout_params(stored_data, params):
 
 	``stored_data`` is the Integration Request's data (the server-minted
 	 binding); ``params`` come from the browser. Client values for
-	 :data:`CHECKOUT_TRUSTED_FIELDS` are dropped unless the stored row has no
-	 value for that key (a field the server never set cannot be spoofed).
+	 :data:`CHECKOUT_TRUSTED_FIELDS` are always dropped — no exception for
+	 empty stored values, since a token minted before a field existed must
+	 not let the request supply it.
 	"""
 	params = dict(params or {})
 	for key in CHECKOUT_TRUSTED_FIELDS:
-		if key in params and stored_data.get(key) not in (None, ""):
-			params.pop(key)
+		params.pop(key, None)
 	merged = dict(stored_data or {})
 	merged.update(params)
 	return merged

@@ -9,7 +9,7 @@
 # checkout signature are stubbed; everything else runs for real.
 
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -301,6 +301,137 @@ class TestCheckoutBinding(FrappeTestCase):
 			)
 
 		self.assertNotIn("receipt", sent)
+
+	def test_order_notes_win_over_payment_notes(self):
+		"""The order's notes (server-minted) are used for settlement, not the
+		payment entity's notes (browser-set)."""
+		stored_ref = _make_reference("order notes ref")
+		other_ref = _make_reference("payment notes ref")
+		_make_integration_request("ToDo", stored_ref)
+
+		# the payment entity carries DIFFERENT notes than the order
+		event = {
+			"event": "payment.captured",
+			"id": "evt_notes",
+			"payload": {
+				"payment": {
+					"entity": {
+						"id": "pay_notes",
+						"status": "captured",
+						"order_id": "order_STORED",
+						"amount": 10000,
+						"currency": "INR",
+						"notes": {"reference_doctype": "ToDo", "reference_docname": other_ref},
+					}
+				}
+			},
+		}
+		order_resp = {
+			"id": "order_STORED",
+			"amount": 10000,
+			"currency": "INR",
+			"notes": {"reference_doctype": "ToDo", "reference_docname": stored_ref},
+		}
+
+		from razorpay_payment.gateway import reconciliation
+
+		settings = MagicMock(name="RS")
+		with (
+			patch("razorpay_payment.gateway.reconciliation.make_get_request", return_value=order_resp),
+			patch("razorpay_payment.gateway.reconciliation.get_razorpay_auth", return_value=("k", "s")),
+			patch("razorpay_payment.gateway.reconciliation.frappe.db.exists", side_effect=[False, True]),
+			patch("razorpay_payment.gateway.reconciliation.frappe.get_doc") as get_doc,
+		):
+			ref = MagicMock(name="ref")
+			ref.doctype = "ToDo"
+			get_doc.return_value = ref
+			result = reconciliation.reconcile_payment_captured(event, settings)
+
+		self.assertEqual(result["status_label"], "Processed")
+		self.assertEqual(result["reference_name"], stored_ref)
+
+	def test_payment_amount_mismatch_throws(self):
+		"""A payment whose amount differs from the order amount is rejected."""
+		stored_ref = _make_reference("mismatch ref")
+		_make_integration_request("ToDo", stored_ref)
+
+		event = {
+			"event": "payment.captured",
+			"id": "evt_mismatch",
+			"payload": {
+				"payment": {
+					"entity": {
+						"id": "pay_mismatch",
+						"status": "captured",
+						"order_id": "order_STORED",
+						"amount": 5000,
+						"currency": "INR",
+					}
+				}
+			},
+		}
+		order_resp = {"id": "order_STORED", "amount": 10000, "currency": "INR"}
+
+		from razorpay_payment.gateway import reconciliation
+
+		settings = MagicMock(name="RS")
+		with (
+			patch("razorpay_payment.gateway.reconciliation.make_get_request", return_value=order_resp),
+			patch("razorpay_payment.gateway.reconciliation.get_razorpay_auth", return_value=("k", "s")),
+			self.assertRaises(frappe.ValidationError),
+		):
+			reconciliation.reconcile_payment_captured(event, settings)
+
+	def test_trusted_key_dropped_when_stored_is_empty(self):
+		"""merge_checkout_params drops a trusted key even when the stored
+		       data has no value for it — a token minted before the field existed
+		must not let the request supply it."""
+		from razorpay_payment.gateway.references import merge_checkout_params
+
+		stored = {"order_id": "order_A"}  # no payment_transaction
+		params = {"payment_transaction": "PAY-FAKE", "order_id": "order_B"}
+		merged = merge_checkout_params(stored, params)
+
+		self.assertNotIn("payment_transaction", merged)
+		self.assertEqual(merged["order_id"], "order_A")
+
+	def test_authorized_token_does_not_settle_again(self):
+		"""A token in Authorized status: both make_payment and
+		order_payment_success are no-ops."""
+		stored_ref = _make_reference("authorized replay")
+		ir = _make_integration_request("ToDo", stored_ref)
+		frappe.db.set_value("Integration Request", ir, "status", "Authorized", update_modified=False)
+
+		settings = MagicMock(name="RS")
+		settings.name = "Razorpay Settings"
+
+		# order_payment_success no-op
+		with (
+			patch(f"{MODULE}.make_get_request") as api,
+			patch.object(RazorpaySettings, "authorize_reference") as settle,
+		):
+			order_payment_success(
+				ir, json.dumps({"razorpay_payment_id": "pay_1", "razorpay_signature": "sig"})
+			)
+		api.assert_not_called()
+		settle.assert_not_called()
+
+		# make_payment no-op
+		with (
+			patch(f"{MODULE}.make_get_request") as api2,
+			patch.object(RazorpaySettings, "authorize_reference") as settle2,
+		):
+			make_payment(
+				razorpay_payment_id="pay_1",
+				options=json.dumps({"amount": 10000}),
+				reference_doctype="ToDo",
+				reference_docname=stored_ref,
+				token=ir,
+				razorpay_order_id="order_STORED",
+				razorpay_signature="sig",
+			)
+		api2.assert_not_called()
+		settle2.assert_not_called()
 
 	def test_completed_token_cannot_settle_twice(self):
 		"""A replayed callback for a completed token is a no-op: no second
