@@ -16,6 +16,8 @@ from payment_core.utils import (
 	success_redirect,
 )
 
+from razorpay_payment.gateway.collect_now import POLICY
+
 __all__ = [
 	"CHECKOUT_TRUSTED_FIELDS",
 	"assert_reference_payable",
@@ -39,6 +41,7 @@ CHECKOUT_TRUSTED_FIELDS = (
 	"reference_doctype",
 	"reference_docname",
 	"payment_transaction",
+	POLICY,
 )
 
 

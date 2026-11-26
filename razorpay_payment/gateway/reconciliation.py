@@ -14,6 +14,7 @@ from frappe.utils import cint, flt, getdate, now_datetime, nowdate
 from payment_core.utils import erpnext_app_import_guard
 from payment_core.webhooks import mark_failed, mark_processed
 
+from razorpay_payment.gateway import collect_now
 from razorpay_payment.gateway.client import from_minor_units, get_razorpay_auth
 from razorpay_payment.gateway.constants import RAZORPAY_API_BASE
 from razorpay_payment.gateway.ledger import (
@@ -28,9 +29,24 @@ SWEEP_ATTEMPT_RE = re.compile(r"^sweep attempt (\d+):")
 def route_event(event, settings):
 	"""Dispatch a Razorpay webhook event to its handler."""
 	handler = _HANDLERS.get(event.get("event"))
-	if not handler:
-		return {"status_label": "Ignored"}
-	return handler(event, settings)
+	result = handler(event, settings) if handler else {"status_label": "Ignored"}
+	if result.get("reference_name") or event.get("event") == "payment.captured":
+		return result
+
+	payload = event.get("payload") or {}
+	payment = (payload.get("payment") or {}).get("entity") or {}
+	order = (payload.get("order") or {}).get("entity") or {}
+	order_id = payment.get("order_id") or order.get("id")
+	if order_id and (checkout := collect_now.find_checkout(order_id)):
+		result.update(_checkout_reference(checkout))
+	return result
+
+
+def _checkout_reference(checkout):
+	return {
+		"reference_doctype": checkout.reference_doctype,
+		"reference_name": checkout.reference_docname,
+	}
 
 
 def reconcile_payment_captured(event, settings):  # dispatched via _HANDLERS
@@ -53,6 +69,11 @@ def reconcile_payment_captured(event, settings):  # dispatched via _HANDLERS
 
 	if not order_id:
 		return {"status_label": "Ignored"}
+
+	checkout = collect_now.find_checkout(order_id)
+	if checkout:
+		collect_now.verify_and_settle(settings, checkout.name, payment_id=payment_id)
+		return {"status_label": "Processed", **_checkout_reference(checkout)}
 
 	# Fetch the order: its notes are the server-minted binding, and its
 	# amount is the checkout's amount. Both are compared with the payment.
@@ -87,7 +108,11 @@ def reconcile_payment_captured(event, settings):  # dispatched via _HANDLERS
 
 	# De-dupe at the ledger level: one Payment Entry per Razorpay payment id.
 	if frappe.db.exists("Payment Entry", {"reference_no": payment_id, "docstatus": 1}):
-		return {"status_label": "Ignored"}
+		return {
+			"status_label": "Ignored",
+			"reference_doctype": reference_doctype,
+			"reference_name": reference_docname,
+		}
 
 	ref = frappe.get_doc(reference_doctype, reference_docname)
 	if ref.doctype == "Payment Request":
@@ -111,6 +136,11 @@ def mark_payment_failed(event, settings):  # dispatched via _HANDLERS
 	"""payment.failed — fail the ledger transaction and comment on the order-bound reference."""
 	payment_entity = event.get("payload", {}).get("payment", {}).get("entity", {})
 	order_id = payment_entity.get("order_id")
+
+	checkout = collect_now.find_checkout(order_id) if order_id else None
+	if checkout:
+		collect_now.verify_and_settle(settings, checkout.name, payment_id=payment_entity.get("id"))
+		return {"status_label": "Processed", **_checkout_reference(checkout)}
 
 	notes = {}
 	if order_id:
@@ -139,6 +169,11 @@ def mark_payment_failed(event, settings):  # dispatched via _HANDLERS
 				payment_entity.get("error_description", "Unknown error")
 			),
 		)
+		return {
+			"status_label": "Processed",
+			"reference_doctype": reference_doctype,
+			"reference_name": reference_docname,
+		}
 
 	return {"status_label": "Processed"}
 
@@ -181,6 +216,8 @@ def sweep_pending():
 			mark_processed(
 				row.name,
 				status=result.get("status_label", "Processed"),
+				reference_doctype=result.get("reference_doctype"),
+				reference_docname=result.get("reference_name"),
 			)
 		except Exception:
 			frappe.db.rollback(save_point="razorpay_webhook_sweep_row")

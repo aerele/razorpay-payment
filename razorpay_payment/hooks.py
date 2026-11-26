@@ -35,6 +35,7 @@ scheduler_events = {
 	"hourly": [
 		"razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings.capture_payment",
 		"razorpay_payment.gateway.reconciliation.sweep_pending",
+		"razorpay_payment.gateway.collect_now.retry_pending",
 	],
 }
 

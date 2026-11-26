@@ -85,7 +85,7 @@ from payment_core.utils import (
 from payment_core.webhooks import mark_failed, mark_processed
 from razorpay.errors import BadRequestError
 
-from razorpay_payment.gateway import ledger, reconciliation, settlement
+from razorpay_payment.gateway import collect_now, ledger, reconciliation, settlement
 from razorpay_payment.gateway.client import (
 	from_minor_units,
 	get_razorpay_auth,
@@ -462,16 +462,27 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 				if currency:
 					kwargs["currency"] = currency
 
-		# Shared-ledger sites: create (or reuse) the Payment Transaction first —
-		# its outstanding_amount is the amount authority for retried/partial
-		# payments. Gateway-only sites get None back and skip every sync.
-		ledger_available = frappe.db.table_exists("Payment Transaction")
+		is_subscription = is_subscription_reference(kwargs)
+		# Collect Now uses ERPNext Payment Entry settlement even when the shared ledger is enabled.
+		kwargs.pop(collect_now.POLICY, None)
+		if (
+			reference_doctype == "Payment Request"
+			and not is_subscription
+			and cint(self.get(collect_now.POLICY))
+		):
+			kwargs[collect_now.POLICY] = True
+
+		# Shared-ledger transactions supply the outstanding amount for retries and partial payments.
+		ledger_available = not kwargs.get(collect_now.POLICY) and frappe.db.table_exists(
+			"Payment Transaction"
+		)
 		if not ledger_available:
 			# A caller may pass a transaction name even on an ERPNext-only site.
 			# Do not persist a ledger-only binding that webhook routing cannot read.
 			kwargs.pop("payment_transaction", None)
 		payment_transaction_supplied = bool(kwargs.get("payment_transaction"))
-		ledger.ensure_payment_transaction(self, kwargs)
+		if not kwargs.get(collect_now.POLICY):
+			ledger.ensure_payment_transaction(self, kwargs)
 		if kwargs.get("payment_transaction") and ledger_available:
 			txn = frappe.db.get_value(
 				"Payment Transaction",
@@ -495,7 +506,7 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 
 		# Subscription references branch to the Razorpay Subscription create flow
 		# (POST /v1/subscriptions → short_url) instead of the one-off Order flow.
-		if is_subscription_reference(kwargs):
+		if is_subscription:
 			# create_razorpay_subscription needs a plain dict, not kwargs.
 			checkout_url = create_razorpay_subscription(self.name, kwargs)
 			ledger.sync_payment_transaction(
@@ -538,6 +549,8 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		# Creating Orders https://razorpay.com/docs/api/orders/
 
 		currency = kwargs.get("currency") or "INR"
+		if kwargs.get(collect_now.POLICY):
+			kwargs["currency"] = currency
 		# Convert major units → minor (paise) for all non-zero-decimal currencies.
 		kwargs["amount"] = to_minor_units(kwargs["amount"], currency)
 
@@ -565,7 +578,19 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 				)
 				# Persist the order id on the Integration Request so the reused token
 				# carries it (checkout context + settlement order-binding need it).
-				integration_request.update_status({"order_id": order.get("id")}, integration_request.status)
+				if kwargs.get(collect_now.POLICY):
+					integration_request.db_set(
+						{
+							"request_id": order["id"],
+							"output": "",
+							"data": frappe.as_json({**kwargs, "order_id": order["id"]}),
+						},
+						update_modified=False,
+					)
+				else:
+					integration_request.update_status(
+						{"order_id": order.get("id")}, integration_request.status
+					)
 				order["integration_request"] = integration_request.name
 				return order  # Order returned to be consumed by razorpay.js
 			except Exception:
@@ -585,6 +610,9 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 			stored = json.loads(self.integration_request.data)
 			if not (stored.get("order_id") or stored.get("subscription_id")):
 				frappe.throw(_("Invalid payment token."), frappe.ValidationError)
+
+			if stored.get(collect_now.POLICY):
+				return collect_now.handle_callback(self, self.integration_request.name, stored, self.data)
 
 			if not self._claim_settlement(self.data, status="Queued"):
 				return {"redirect_to": "payment-success", "status": 200}
@@ -799,6 +827,9 @@ class RazorpaySettings(GatewayControllerMixin, Document):
 		"""
 		data = getattr(self, "data", None) or {}
 		flags = getattr(self, "flags", None) or {}
+		verified = flags.get("collect_now_verified_payment")
+		if verified:
+			return from_minor_units(verified["amount"], verified["currency"])
 		payment_id = flags.get("razorpay_payment_id") or data.get("razorpay_payment_id")
 		if not payment_id or not str(payment_id).startswith("pay_"):
 			return None
@@ -1146,6 +1177,9 @@ def capture_payment(is_sandbox=False, sanbox_response=None):
 		provider_captured = False
 		try:
 			data = json.loads(row.data)
+			if data.get(collect_now.POLICY):
+				frappe.db.release_savepoint("razorpay_capture_row")
+				continue
 			if is_sandbox:
 				resp = sanbox_response
 			else:
@@ -1262,6 +1296,9 @@ def order_payment_success(integration_request: str, params: str):
 	if not (stored.get("order_id") or stored.get("subscription_id")):
 		frappe.throw(_("Invalid payment token."), frappe.ValidationError)
 
+	if stored.get(collect_now.POLICY):
+		return collect_now.handle_callback(controller, integration.name, stored, params)
+
 	if not controller._claim_settlement(params):
 		return
 
@@ -1282,9 +1319,14 @@ def order_payment_failure(integration_request: str, params: str):
 	"""
 	if frappe.session.user != "Guest":
 		frappe.has_permission("Integration Request", "read", integration_request, throw=True)
+	integration = frappe.get_doc("Integration Request", integration_request)
+	if json.loads(integration.data or "{}").get(collect_now.POLICY):
+		collect_now.record_client_failure(integration.name, json.loads(params))
+		return
+
 	frappe.log_error(params, "Razorpay Payment Failure")
 	params = json.loads(params)
-	integration = frappe.get_doc("Integration Request", integration_request)
+	params.pop(collect_now.POLICY, None)
 	integration.update_status(params, integration.status)
 
 
