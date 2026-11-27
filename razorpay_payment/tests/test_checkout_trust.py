@@ -18,6 +18,7 @@ from razorpay_payment.gateway import ledger, reconciliation
 from razorpay_payment.gateway.references import merge_checkout_params
 from razorpay_payment.razorpay.doctype.razorpay_settings.razorpay_settings import (
 	RazorpaySettings,
+	order_payment_failure,
 	order_payment_success,
 )
 from razorpay_payment.templates.pages.razorpay_checkout import make_payment
@@ -131,6 +132,47 @@ class TestCheckoutBinding(FrappeTestCase):
 		self.assertEqual(data["amount"], 10000)
 		self.assertEqual(data["reference_docname"], stored_ref)
 		self.assertEqual(frappe.db.get_value("Integration Request", ir, "status"), "Completed")
+
+	def test_failure_report_keeps_the_stored_checkout(self):
+		"""A failure report carrying checkout keys is stored as the error only,
+		so a later success callback still settles the stored binding."""
+		stored_ref = _make_reference("stored before failure")
+		other_ref = _make_reference("named in failure")
+		ir = _make_integration_request("ToDo", stored_ref)
+		before = _ir_data(ir)
+
+		order_payment_failure(
+			ir,
+			json.dumps(
+				{
+					"error": {"code": "BAD_REQUEST_ERROR"},
+					"order_id": "order_OTHER",
+					"reference_doctype": "ToDo",
+					"reference_docname": other_ref,
+					"amount": 1,
+					"settlement_started": "2026-01-01T00:00:00",
+				}
+			),
+		)
+		self.assertEqual(_ir_data(ir), before)
+		self.assertEqual(frappe.db.get_value("Integration Request", ir, "status"), "Queued")
+		self.assertIn("BAD_REQUEST_ERROR", frappe.db.get_value("Integration Request", ir, "error"))
+
+		with (
+			patch.object(RazorpaySettings, "verify_checkout_signature", return_value=True),
+			patch(f"{MODULE}.make_get_request", return_value=_payment_entity()),
+			patch.object(RazorpaySettings, "authorize_reference", return_value=None) as settle,
+		):
+			order_payment_success(
+				ir, json.dumps({"razorpay_payment_id": "pay_T1", "razorpay_signature": "sig"})
+			)
+
+		data = _ir_data(ir)
+		self.assertEqual(data["order_id"], "order_STORED")
+		self.assertEqual(data["amount"], 10000)
+		self.assertEqual(data["reference_docname"], stored_ref)
+		self.assertEqual(frappe.db.get_value("Integration Request", ir, "status"), "Completed")
+		settle.assert_called_once()
 
 	def test_payment_for_another_checkout_is_rejected(self):
 		"""A provider payment whose order or amount does not match the stored

@@ -25,6 +25,12 @@ $(document).ready(function(){
 		}
 
 		var rzp = new Razorpay(options);
+		// Collect Now stores every failed attempt; the Status API check decides the outcome.
+		if ("{{ collect_now or '' }}" && options["order_id"]) {
+			rzp.on("payment.failed", function (response) {
+				razorpay.record_payment_failure(response.error, "{{ token }}");
+			});
+		}
 		rzp.open();
 		//	e.preventDefault();
 	})();
@@ -56,6 +62,18 @@ razorpay.make_payment_log = function(response, options, doctype, docname, token)
 			else if (r.message && ([401,400,500].indexOf(r.message.status) > -1)) {
 				window.location.href = r.message.redirect_to
 			}
+		}
+	})
+}
+
+razorpay.record_payment_failure = function(error, token){
+	frappe.call({
+		method: "razorpay_payment.templates.pages.razorpay_checkout.record_payment_failure",
+		type: "POST",
+		headers: {"X-Requested-With": "XMLHttpRequest"},
+		args: {
+			"token": token,
+			"error": JSON.stringify(error || {})
 		}
 	})
 }

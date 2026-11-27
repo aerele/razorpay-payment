@@ -13,6 +13,8 @@ from razorpay_payment.gateway.constants import RAZORPAY_CUSTOM_FIELDS
 def after_install():
 	# Never let install/migrate abort mid-way and leave the site inconsistent.
 	try:
+		# Collect Now webhooks find their checkout by order ID (Integration Request.request_id).
+		frappe.db.add_index("Integration Request", ["request_id"])
 		if "erpnext" not in frappe.get_installed_apps():
 			return
 		click.secho("* Installing Razorpay custom fields")

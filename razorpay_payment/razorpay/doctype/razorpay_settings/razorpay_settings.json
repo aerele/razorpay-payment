@@ -152,6 +152,18 @@
    "search_index": 0,
    "set_only_once": 0,
    "unique": 0
+  },
+  {
+   "fieldname": "collect_now_section",
+   "fieldtype": "Section Break",
+   "label": "Collect Now"
+  },
+  {
+   "default": "0",
+   "description": "Require independent Razorpay payment status verification for new one-time ERPNext Payment Requests.",
+   "fieldname": "require_collect_now_status_verification",
+   "fieldtype": "Check",
+   "label": "Require Status API Verification"
   }
  ],
  "hide_heading": 0,

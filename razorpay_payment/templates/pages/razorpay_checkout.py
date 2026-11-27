@@ -4,9 +4,11 @@ import json
 
 import frappe
 from frappe import _
+from frappe.rate_limiter import rate_limit
 from frappe.utils import cint, flt
 from payment_core.utils import guard_payment_reference, validate_integration_request
 
+from razorpay_payment.gateway.collect_now import POLICY, is_payable, record_client_failure
 from razorpay_payment.gateway.references import assert_reference_payable
 
 no_cache = 1
@@ -26,6 +28,7 @@ expected_keys = (
 def get_context(context):
 	context.no_cache = 1
 	context.api_key = get_api_key()
+	payable = True
 
 	try:
 		validate_integration_request(frappe.form_dict["token"])
@@ -33,6 +36,11 @@ def get_context(context):
 		# Only the data field is consumed — read it directly (no full-doc load).
 		data_json = frappe.db.get_value("Integration Request", frappe.form_dict["token"], "data")
 		payment_details = json.loads(data_json)
+		context.collect_now = cint(payment_details.get(POLICY))
+		if context.collect_now:
+			# Collect Now skips the payable check at payment time, so a stale link must not open checkout.
+			payable = is_payable(payment_details)
+			context.api_key = frappe.get_doc("Razorpay Settings").get_settings(payment_details).api_key
 
 		for key in expected_keys:
 			context[key] = payment_details[key]
@@ -56,6 +64,16 @@ def get_context(context):
 			indicator_color="red",
 		)
 
+		frappe.local.flags.redirect_location = frappe.local.response.location
+		raise frappe.Redirect
+
+	if not payable:
+		frappe.redirect_to_message(
+			_("Payment Not Required"),
+			_("This payment request is already paid or is no longer open."),
+			http_status_code=400,
+			indicator_color="orange",
+		)
 		frappe.local.flags.redirect_location = frappe.local.response.location
 		raise frappe.Redirect
 
@@ -94,7 +112,8 @@ def make_payment(
 	guard_payment_reference(reference_doctype, reference_docname)
 	if frappe.session.user != "Guest":
 		frappe.has_permission(reference_doctype, "read", reference_docname, throw=True)
-	assert_reference_payable(reference_doctype, reference_docname)
+	if not stored.get(POLICY):
+		assert_reference_payable(reference_doctype, reference_docname)
 
 	data = {}
 
@@ -114,3 +133,22 @@ def make_payment(
 
 	# Frappe commits at request end, before the response reaches the browser.
 	return frappe.get_doc("Razorpay Settings").create_request(data)
+
+
+@frappe.whitelist(  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
+	allow_guest=True, methods=["POST"]
+)
+@rate_limit(limit=30, seconds=60 * 60)
+def record_payment_failure(token: str, error: str):
+	"""Store the failure Razorpay Checkout reported to the payer's browser.
+
+	The Integration Request token authorizes the guest call, as in make_payment. The report is
+	evidence only: it cannot change the checkout status, which the Status API check decides.
+	"""
+	if frappe.db.get_value("Integration Request", token, "integration_request_service") != "Razorpay":
+		return
+	try:
+		payload = json.loads(error)
+	except ValueError:
+		return
+	record_client_failure(token, payload)
