@@ -1311,11 +1311,11 @@ def order_payment_success(integration_request: str, params: str):
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 def order_payment_failure(integration_request: str, params: str):
-	"""Called by razorpay.js on failure
+	"""Called by razorpay.js on failure.
 
 	Args:
-	        integration_request (TYPE): Description
-	        params (TYPE): error data to be updated
+	        integration_request: the checkout's Integration Request.
+	        params: the failure reported by Razorpay Checkout, stored as the request's error.
 	"""
 	if frappe.session.user != "Guest":
 		frappe.has_permission("Integration Request", "read", integration_request, throw=True)
@@ -1325,9 +1325,8 @@ def order_payment_failure(integration_request: str, params: str):
 		return
 
 	frappe.log_error(params, "Razorpay Payment Failure")
-	params = json.loads(params)
-	params.pop(collect_now.POLICY, None)
-	integration.update_status(params, integration.status)
+	# Keep the reported failure beside the checkout data; the stored checkout itself is never changed here.
+	integration.db_set("error", frappe.as_json(json.loads(params)), update_modified=False)
 
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
